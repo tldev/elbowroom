@@ -1,7 +1,7 @@
 # Elbowroom
 
 **Room to build.** Elbowroom explains every gigabyte on a small-disk Mac and
-reclaims what regenerates. Native macOS, SwiftUI, no dependencies.
+reclaims what regenerates. Native macOS and SwiftUI, with Sparkle for signed automatic updates.
 
 The premise: a full developer disk is a comprehension problem wearing a storage
 costume. Nobody tells you that a simulator runtime is a re-downloadable OS
@@ -38,6 +38,23 @@ Xcode too.
 
 Regenerable assets: `Scripts/gensounds.py` (UI sounds),
 `Scripts/genicon.swift` (app icon → `Assets/AppIcon.icns`).
+
+## Install and release
+
+Open the DMG, drag Elbowroom to Applications, and launch it from there.
+All features are free. Release downloads support Apple Silicon and Intel Macs.
+
+The [release guide](docs/RELEASING.md) covers Dorso-style installer previews,
+semantic version bumps, changelog entries, notarization, and automatic updates.
+
+```sh
+./test-dmg.sh                    # local installer preview
+./release.sh 1.1.0               # signed, notarized DMG + ZIP; stays local
+./release.sh 1.1.0 --publish     # explicitly publish and update the feed
+```
+
+Version/build metadata lives in `release.json`; release notes come from
+`CHANGELOG.md`. Developer builds do not start the automatic updater.
 
 ## Layout
 
@@ -152,6 +169,6 @@ with `swift run ElbowroomSnapshots` before shipping.
 
 ## Remaining external steps (not code)
 
-- **Distribution:** notarize the Developer ID build for direct download.
+- **Distribution:** publish the tested release using `release.sh --publish`.
 - **Japanese review:** the ja table is authored for native review before
   release.

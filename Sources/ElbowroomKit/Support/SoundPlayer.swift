@@ -17,8 +17,8 @@ public final class SoundPlayer {
     /// lookups run because .process can flatten.
     static func resourceURL(_ sound: ElbowroomSound) -> URL? {
         for ext in ["wav", "mp3"] {
-            if let url = Bundle.module.url(forResource: "Sounds/\(sound.rawValue)", withExtension: ext)
-                ?? Bundle.module.url(forResource: sound.rawValue, withExtension: ext) {
+            if let url = AppResources.bundle.url(forResource: "Sounds/\(sound.rawValue)", withExtension: ext)
+                ?? AppResources.bundle.url(forResource: sound.rawValue, withExtension: ext) {
                 return url
             }
         }

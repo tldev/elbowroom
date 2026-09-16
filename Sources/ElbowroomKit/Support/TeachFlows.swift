@@ -174,8 +174,8 @@ public struct TeachFlow: Identifiable, Sendable {
 public enum TeachFigures {
     public static func url(_ base: String) -> URL? {
         for name in ["\(base)-\(Loc.lang)", "\(base)-en"] {
-            if let u = Bundle.module.url(forResource: "Figures/\(name)", withExtension: "png")
-                ?? Bundle.module.url(forResource: name, withExtension: "png") {
+            if let u = AppResources.bundle.url(forResource: "Figures/\(name)", withExtension: "png")
+                ?? AppResources.bundle.url(forResource: name, withExtension: "png") {
                 return u
             }
         }

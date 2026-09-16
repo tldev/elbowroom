@@ -21,3 +21,15 @@ regenerates. Build, test, and layout: see README.
   headroom) — never bespoke cards or chrome.
 - The product's identity: explain before acting, show the literal command,
   verify before destroying, measure rather than promise.
+
+## Releases
+
+- Follow `docs/RELEASING.md` for Dorso-style DMG/ZIP releases and semantic versions.
+- `release.json` owns version and build; `CHANGELOG.md` owns user-facing notes.
+  Increase both version and build for every release. Never replace a published tag.
+- "Ship it" means synchronize main, review notes, test, commit, then run
+  `./release.sh X.Y.Z --publish`. Building an installer alone does not publish it.
+- Preserve `dev.elbowroom.app`, the Elbowroom Sparkle key, and existing user data.
+  Never copy Dorso's App Store targets, feed, paid features, or reset commands.
+- Use isolated `dist/releases/` or `dist/previews/` output for packaging so the
+  founder's running app is not replaced. Never reset permissions or preferences.

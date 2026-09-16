@@ -6,6 +6,9 @@ import Foundation
 /// Drafted for native review before store submission.
 extension Loc {
     static let jaStrings: [String: String] = [
+        "Check for updates automatically": "アップデートを自動で確認",
+        "Check for updates": "アップデートを確認",
+        "Version %@": "バージョン %@",
         "View all items": "すべての項目を表示",
         "Your apps can recreate these files.": "アプリが再生成できるファイルです。",
         "Your tools can rebuild these files.": "ツールが再生成できるファイルです。",

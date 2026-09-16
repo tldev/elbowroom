@@ -6,7 +6,11 @@ public struct ElbowroomSettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var tab = 0
 
-    public init() {}
+    private let automaticUpdates: Binding<Bool>?
+
+    public init(automaticUpdates: Binding<Bool>? = nil) {
+        self.automaticUpdates = automaticUpdates
+    }
 
     private var tabs: [String] {
         [Loc.t("General"), Loc.t("Receipts"), Loc.t("Privacy")]
@@ -42,7 +46,7 @@ public struct ElbowroomSettingsView: View {
             .overlay(alignment: .bottom) { Divider().overlay(BColor.hair) }
             Group {
                 switch tab {
-                case 0: GeneralPane()
+                case 0: GeneralPane(automaticUpdates: automaticUpdates)
                 case 1: ReceiptsPane()
                 default: PrivacyPane()
                 }
@@ -55,6 +59,7 @@ public struct ElbowroomSettingsView: View {
 }
 
 struct GeneralPane: View {
+    var automaticUpdates: Binding<Bool>? = nil
     @Environment(AppModel.self) private var model
     @AppStorage(Loc.overrideKey) private var langOverride = ""
 
@@ -80,6 +85,15 @@ struct GeneralPane: View {
                             .controlSize(.small)
                     }
                     Divider().overlay(BColor.hair)
+                    if let automaticUpdates {
+                        settingsRow(Copy.automaticUpdateChecks) {
+                            Toggle("", isOn: automaticUpdates)
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .controlSize(.small)
+                        }
+                        Divider().overlay(BColor.hair)
+                    }
                     settingsRow(Copy.keepInTrashLabel) {
                         Toggle("", isOn: $settings.keepInTrashDefault)
                             .labelsHidden()
@@ -329,7 +343,7 @@ public struct AboutView: View {
                     .font(BFont.meta)
                     .foregroundStyle(BColor.inkSoft)
             }
-            Text(Loc.t("1.0 · made with unreasonable care"))
+            Text(Copy.appVersion(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"))
                 .font(.system(size: 10))
                 .foregroundStyle(BColor.inkSoft.opacity(0.7))
         }

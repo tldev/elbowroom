@@ -5,6 +5,9 @@ import Foundation
 /// points, and no em-dashes anywhere in the product. Buttons start with verbs.
 /// English strings double as localization keys (`Loc`).
 public enum Copy {
+    public static var automaticUpdateChecks: String { Loc.t("Check for updates automatically") }
+    public static var checkForUpdates: String { Loc.t("Check for updates") }
+    public static func appVersion(_ version: String) -> String { Loc.f("Version %@", version) }
     public static var dockerStartPrompt: String { Loc.t("Open Docker Desktop to see what can be cleaned up. Elbowroom will refresh this list when Docker is ready.") }
     public static var dockerStarting: String { Loc.t("Waiting for Docker Desktop to be ready.") }
     public static var dockerStartupTimeout: String { Loc.t("Docker is not ready yet. Finish any setup in Docker Desktop, then try again.") }
@@ -471,6 +474,7 @@ public enum Copy {
 
     public static var auditableStrings: [String] {
         var all: [String] = storageCopy + [
+            checkForUpdates, automaticUpdateChecks, appVersion("1.1.0"),
             allStorageItems, mergedStorageSummary(.regenerable), mergedStorageSummary(.rebuildable),
             mergedStorageSummary(.system), mergedStorageSummary(.apps), locationCount(1), locationCount(3), groupHideDetails, groupCount(1), groupCount(8), groupTotal("12 GB"),
             pipCacheTitle, pipCacheIdentity, gradleCacheTitle, gradleCacheIdentity,

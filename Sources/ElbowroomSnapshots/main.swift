@@ -400,6 +400,13 @@ for dark in [false, true] {
     snap("cleanup-tm-snapshots", size: NSSize(width: 560, height: 580), dark: dark) {
         CleanupSheet(fixturePlan: Fixtures.tmCleanupPlan()).environment(makeModel())
     }
+    snap("settings-updates", size: NSSize(width: 540, height: 460), dark: dark) {
+        ElbowroomSettingsView(automaticUpdates: .constant(true)).environment(makeModel())
+    }
+    snap("about-version", size: NSSize(width: 320, height: 340), dark: dark) {
+        AboutView().environment(makeModel())
+    }
+
     // B3: the PermissionFlow-style drag helper, waiting and granted.
     let helperWaiting = GrantHelperState()
     let helperGranted = GrantHelperState()
