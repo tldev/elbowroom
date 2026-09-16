@@ -1,0 +1,844 @@
+import SwiftUI
+
+/// The Ledger: the dense truth table and the accessibility backbone.
+/// Full parity with the Cross-Section by design; VoiceOver's canonical surface.
+public struct LedgerView: View {
+    @Environment(AppModel.self) private var model
+    @State private var hoveredID: LedgerRow.ID?
+    @State private var sortField: SortField = .size
+    @State private var sortAscending = false
+    @State private var scope: LedgerScope = .thisMac
+
+    public init(initialSelection: String? = nil) {
+        if let initialSelection {
+            _hoveredID = State(initialValue: initialSelection)
+        }
+    }
+
+    struct LedgerRow: Identifiable {
+        let id: String
+        let name: String
+        let path: String
+        let bytes: Int64
+        let tier: Tier
+        let owner: String
+        let lastTouched: Date?
+        let item: AtlasItem?
+        let insight: SystemInsight?
+    }
+
+    enum LedgerScope { case thisMac, drive }
+
+    /// Items is an inventory with two locations once a drive is adopted:
+    /// this Mac, and the drive. Offloaded folders are first-class rows in
+    /// the drive scope, never interleaved with local sizes.
+    private var scopeBar: some View {
+        HStack(spacing: BSpace.m) {
+            Picker("", selection: $scope) {
+                Text(Copy.reconcileLocalSide).tag(LedgerScope.thisMac)
+                Text(model.stash?.volumeName ?? "").tag(LedgerScope.drive)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 340)
+            Spacer()
+            if scope == .thisMac, let stash = model.stash, stash.stashedBytes > 0 {
+                Button(Copy.ledgerOffloaded(
+                    stash.manifest.entries.filter { $0.status == .done || $0.status == .doneDirty || $0.status == .committed }.count,
+                    ByteFormat.string(stash.stashedBytes), stash.volumeName
+                )) {
+                    scope = .drive
+                }
+                .buttonStyle(.plain)
+                .font(BFont.meta)
+                .foregroundStyle(BColor.brand)
+            }
+        }
+        .padding(.horizontal, BSpace.l)
+        .padding(.top, BSpace.s)
+    }
+
+    private func driveList(_ stash: StashManager) -> some View {
+        let entries = stash.manifest.entries.filter {
+            $0.status == .done || $0.status == .doneDirty || $0.status == .committed
+        }
+        let runtimeDir = stash.stashRoot.appendingPathComponent("Runtimes", isDirectory: true).path
+        let images = ((try? FileManager.default.contentsOfDirectory(atPath: runtimeDir)) ?? [])
+            .filter { $0.hasSuffix(".dmg") }
+            .sorted()
+        return ScrollView {
+            VStack(spacing: BSpace.s) {
+                if entries.isEmpty && images.isEmpty {
+                    EmptyStateView(Copy.kibiStashEmpty, symbol: "externaldrive")
+                        .frame(height: 300)
+                }
+                ForEach(entries) { entry in
+                    driveRow(entry, stash: stash)
+                }
+                ForEach(images, id: \.self) { name in
+                    runtimeImageRow(name: name, dir: runtimeDir)
+                }
+            }
+            .padding(BSpace.l)
+        }
+    }
+
+    private func driveRow(_ entry: StashEntry, stash: StashManager) -> some View {
+        HStack(spacing: BSpace.l) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.displayName)
+                    .font(BFont.body.weight(.medium))
+                    .foregroundStyle(BColor.ink)
+                HStack(spacing: 8) {
+                    Text(ByteFormat.string(entry.bytes))
+                        .font(BFont.rounded(12, .medium))
+                        .foregroundStyle(BColor.inkSoft)
+                    Text(Copy.stashMovedAgo(RelativeDate.short(entry.movedAt)))
+                        .font(BFont.meta)
+                        .foregroundStyle(BColor.inkSoft)
+                    Text(entry.sourcePath)
+                        .font(BFont.meta)
+                        .foregroundStyle(BColor.inkSoft.opacity(0.8))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            Spacer()
+            StashToggle(
+                isStashed: true,
+                progress: stash.progress[entry.id],
+                disabledReason: stash.volumeIsPresent ? nil : Copy.stashConnectFirst(stash.volumeName)
+            ) {
+                model.bringHome(entryID: entry.id)
+            }
+        }
+        .padding(BSpace.m)
+        .background(BColor.surface)
+        .clipShape(RoundedRectangle(cornerRadius: BRadius.control))
+        .overlay(RoundedRectangle(cornerRadius: BRadius.control).strokeBorder(BColor.line, lineWidth: 1))
+    }
+
+    private func runtimeImageRow(name: String, dir: String) -> some View {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: dir + "/" + name)
+        return HStack(spacing: BSpace.l) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text((name as NSString).deletingPathExtension)
+                    .font(BFont.body.weight(.medium))
+                    .foregroundStyle(BColor.ink)
+                HStack(spacing: 8) {
+                    Text(ByteFormat.string((attrs?[.size] as? Int64) ?? 0))
+                        .font(BFont.rounded(12, .medium))
+                        .foregroundStyle(BColor.inkSoft)
+                    Text(Copy.runtimeAddBack(model.stash?.volumeName ?? "?"))
+                        .font(BFont.meta)
+                        .foregroundStyle(BColor.inkSoft)
+                }
+            }
+            Spacer()
+            Button(Copy.addBack) { model.sheet = .cleanup(entryID: "xcode.simRuntimes") }
+                .buttonStyle(SecondarySmallButtonStyle())
+                .accessibilityLabel(Copy.addBack)
+        }
+        .padding(BSpace.m)
+        .background(BColor.surface)
+        .clipShape(RoundedRectangle(cornerRadius: BRadius.control))
+        .overlay(RoundedRectangle(cornerRadius: BRadius.control).strokeBorder(BColor.line, lineWidth: 1))
+    }
+
+    private var rows: [LedgerRow] {
+        // Items is this disk: offloaded folders live in the summary line and
+        // the Offload catalog, not interleaved with local sizes.
+        var out: [LedgerRow] = model.items.filter { !$0.isStashed }.map { item in
+            LedgerRow(
+                id: item.id, name: item.displayName, path: item.url.path,
+                bytes: item.bytes, tier: item.entry.tier,
+                owner: item.projectName ?? item.entry.owner,
+                lastTouched: item.lastTouched, item: item, insight: nil
+            )
+        }
+        for insight in model.result?.insights ?? [] {
+            let entry = Atlas.entry(insight.entryID)
+            out.append(LedgerRow(
+                id: insight.id, name: entry.title, path: "",
+                bytes: insight.bytes, tier: entry.tier, owner: entry.owner,
+                lastTouched: nil, item: nil, insight: insight
+            ))
+        }
+        if let tier = model.ledgerTierFilter {
+            out = out.filter { $0.tier == tier }
+        }
+        if !model.searchText.isEmpty {
+            out = out.filter {
+                $0.name.localizedCaseInsensitiveContains(model.searchText)
+                    || $0.owner.localizedCaseInsensitiveContains(model.searchText)
+                    || $0.path.localizedCaseInsensitiveContains(model.searchText)
+            }
+        }
+        return sorted(out)
+    }
+
+    enum SortField { case name, size, tier, touched }
+
+    private func sorted(_ rows: [LedgerRow]) -> [LedgerRow] {
+        let base: [LedgerRow]
+        switch sortField {
+        case .size:
+            base = rows.sorted { $0.bytes > $1.bytes }
+        case .name:
+            base = rows.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case .tier:
+            base = rows.sorted { $0.tier == $1.tier ? $0.bytes > $1.bytes : $0.tier < $1.tier }
+        case .touched:
+            base = rows.sorted { $0.sortableDate > $1.sortableDate }
+        }
+        return sortAscending ? base.reversed() : base
+    }
+
+    @State private var previewRowID: LedgerRow.ID?
+    @State private var checkAnchorID: LedgerRow.ID?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    public var body: some View {
+        VStack(spacing: 0) {
+            if model.stash != nil { scopeBar }
+            if scope == .drive, let stash = model.stash {
+                driveList(stash)
+            } else {
+                // One evaluation per render: rows maps, filters, and sorts
+                // the whole inventory, so the render path shares it.
+                let current = rows
+                batchBar(current)
+                if current.isEmpty {
+                    EmptyStateView(emptyLine, symbol: emptySymbol)
+                } else {
+                    table(current)
+                }
+            }
+        }
+        .background(BColor.bg)
+        // Space gives a Quick-Look-style preview card on the hovered row.
+        .onKeyPress(.space) {
+            guard let id = hoveredID ?? rows.first?.id, previewRowID == nil else {
+                previewRowID = nil
+                return .handled
+            }
+            previewRowID = id
+            return .handled
+        }
+        .onKeyPress(.escape) {
+            guard previewRowID != nil else { return .ignored }
+            previewRowID = nil
+            return .handled
+        }
+        .overlay {
+            if let id = previewRowID, let row = rows.first(where: { $0.id == id }) {
+                previewCard(row)
+            }
+        }
+    }
+
+    private func previewCard(_ row: LedgerRow) -> some View {
+        VStack(alignment: .leading, spacing: BSpace.m) {
+            HStack {
+                Text(row.name)
+                    .font(BFont.title)
+                    .foregroundStyle(BColor.ink)
+                Spacer()
+                Text(ByteFormat.string(row.bytes))
+                    .font(BFont.rounded(22, .bold))
+                    .foregroundStyle(BColor.ink)
+            }
+            HStack(spacing: BSpace.m) {
+                TierChip(row.tier)
+                if row.lastTouched != nil {
+                    Text(RelativeDate.staleness(row.lastTouched))
+                        .font(BFont.meta)
+                        .foregroundStyle(BColor.inkSoft)
+                }
+            }
+            if let item = row.item {
+                Text(item.entry.identityLine)
+                    .font(BFont.body)
+                    .foregroundStyle(BColor.inkSoft)
+            }
+            Text(row.path)
+                .font(BFont.path)
+                .foregroundStyle(BColor.inkSoft)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(BSpace.sheetPadding)
+        .frame(width: 440)
+        .background(BColor.surface)
+        .clipShape(RoundedRectangle(cornerRadius: BRadius.sheet))
+        .overlay(RoundedRectangle(cornerRadius: BRadius.sheet).strokeBorder(BColor.line, lineWidth: 1))
+        .shadow(color: BColor.ink.opacity(0.1), radius: 24, y: 8)
+        .onTapGesture { previewRowID = nil }
+        .transition(.scale(scale: 0.96).combined(with: .opacity))
+    }
+
+    private func batchBar(_ rows: [LedgerRow]) -> some View {
+        HStack(spacing: BSpace.m) {
+            if let tier = model.ledgerTierFilter {
+                tierFilterChip(tier)
+            }
+            // Installers are the safe bulk case (every row carries "app
+            // already installed"): one plan takes the whole set.
+            if model.ledgerTierFilter == .yours {
+                let installers = model.lensFindings.filter { $0.kind == .installer }
+                if installers.count > 1 {
+                    Button(Copy.reclaimAll) { model.reclaimFindings(installers) }
+                        .buttonStyle(SecondarySmallButtonStyle())
+                }
+            }
+            Button(Copy.selectAllRegenerable) {
+                for row in rows where row.tier == .regenerable && row.item != nil && model.canSelect(row.item!) {
+                    if !model.trayItems.contains(row.item!) { model.toggleTray(row.item!) }
+                }
+            }
+            .buttonStyle(SecondarySmallButtonStyle())
+            Button(Copy.selectStale) {
+                let cutoff = Date().addingTimeInterval(-90 * 86_400)
+                for row in rows {
+                    guard let item = row.item, model.canSelect(item),
+                          let touched = row.lastTouched, touched < cutoff,
+                          !model.trayItems.contains(item) else { continue }
+                    model.toggleTray(item)
+                }
+            }
+            .buttonStyle(SecondarySmallButtonStyle())
+            Spacer()
+            Text(sortField == .size && !sortAscending
+                 ? "\(Copy.itemCount(rows.count)) · \(Copy.sortedBySize)"
+                 : Copy.itemCount(rows.count))
+                .font(BFont.meta)
+                .foregroundStyle(BColor.inkSoft)
+        }
+        .padding(.horizontal, BSpace.l)
+        .padding(.vertical, BSpace.s)
+    }
+
+    /// After a lens pass finds nothing, the Personal filter says so in its
+    /// own words instead of pretending a search failed.
+    private var emptyLine: String {
+        if model.ledgerTierFilter == .yours && model.searchText.isEmpty && !model.scanning {
+            return Copy.lensEmpty
+        }
+        return model.searchText.isEmpty && model.ledgerTierFilter == nil
+            ? Copy.kibiDenTidy : Copy.kibiSearchNone
+    }
+
+    private var emptySymbol: String {
+        model.ledgerTierFilter == .yours ? "magnifyingglass" : "checkmark.circle"
+    }
+
+    /// The active Disk Strip tier filter, worn as a TierChip with an ✕.
+    /// Sits with the batch actions; clicking it clears the filter.
+    private func tierFilterChip(_ tier: Tier) -> some View {
+        Button {
+            withAnimation(BMotion.light) { model.ledgerTierFilter = nil }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: tier.systemImage)
+                    .font(.system(size: 10, weight: .semibold))
+                Text(tier.label)
+                    .font(.system(size: 11, weight: .medium))
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+                    .opacity(0.7)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 22)
+            .foregroundStyle(tier.color)
+            .background(tier.color.opacity(0.18), in: Capsule())
+            .overlay(Capsule().strokeBorder(tier.color.opacity(0.55), lineWidth: 1))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(Copy.clearFilter)
+        .accessibilityLabel("\(tier.label). \(Copy.clearFilter)")
+    }
+
+    /// The mock's grid, hand-built (Warm Instrument): transparent rows on
+    /// bg, surface wash on hover, accent-soft wash for rows in the plan,
+    /// hairline separators, one fixed order. Columns 52 · flex · 110 · 140 ·
+    /// 130 · 100 inside 24 pt gutters.
+    private func table(_ rows: [LedgerRow]) -> some View {
+        VStack(spacing: 0) {
+            columnHeader
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(rows) { row in
+                        itemRow(row)
+                    }
+                }
+            }
+        }
+    }
+
+    private var columnHeader: some View {
+        HStack(spacing: 0) {
+            Color.clear.frame(width: 52, height: 1)
+            headerCell(Copy.colName, field: .name, alignment: .leading)
+            headerCell(Copy.colSize, field: .size, alignment: .trailing)
+                .frame(width: 110)
+            headerCell(Copy.colTier, field: .tier, alignment: .leading)
+                .frame(width: 140)
+                .padding(.leading, 24)
+            headerCell(Copy.colLastTouched, field: .touched, alignment: .leading)
+                .frame(width: 130)
+            Color.clear.frame(width: 100, height: 1)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 6)
+        .overlay(alignment: .bottom) { Divider().overlay(BColor.hair) }
+    }
+
+    /// Sortable header: click to sort, click again to flip. The active
+    /// column wears a real chevron, not a text glyph.
+    private func headerCell(_ label: String, field: SortField, alignment: Alignment) -> some View {
+        Button {
+            if sortField == field {
+                sortAscending.toggle()
+            } else {
+                sortField = field
+                sortAscending = false
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(label.uppercased())
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .kerning(0.46)
+                    .foregroundStyle(sortField == field ? BColor.inkSoft : BColor.faint)
+                if sortField == field {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 7.5, weight: .bold))
+                        .foregroundStyle(BColor.inkSoft)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: alignment)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(sortField == field ? [.isSelected] : [])
+    }
+
+    private func itemRow(_ row: LedgerRow) -> some View {
+        let finding = lensFinding(row)
+        let selectable = row.item.map { model.canSelect($0) } ?? false
+        let checked = selectable && row.item.map { model.trayItems.contains($0) } == true
+        return HStack(spacing: 0) {
+            // Checkbox zone (52): the mock's 18 pt rounded accent box.
+            HStack {
+                if selectable {
+                    planCheckbox(checked: checked)
+                }
+            }
+            .frame(width: 52, alignment: .leading)
+
+            // Name: icon or fan, then name over one quiet sub line.
+            HStack(spacing: 12) {
+                if let finding, finding.wearsMediaFan {
+                    MediaFan(samples: finding.samples)
+                } else {
+                    ItemIcon(
+                        entryID: row.item?.entryID ?? row.insight?.entryID ?? "",
+                        url: row.item?.url, tier: row.tier,
+                        owner: row.owner, lensKind: finding?.kind
+                    )
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 6) {
+                        Text(row.name)
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundStyle(BColor.ink)
+                            .lineLimit(1)
+                        if row.item == nil {
+                            HollowBadge()
+                        }
+                    }
+                    Text(subLine(row, finding: finding))
+                        .font(.system(size: 12))
+                        .foregroundStyle(BColor.inkSoft)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(row.bytes > 0 ? ByteFormat.string(row.bytes) : "")
+                .font(BFont.rounded(13.5, .bold))
+                .foregroundStyle(BColor.ink)
+                .frame(width: 110, alignment: .trailing)
+
+            TierChip(row.tier)
+                .frame(width: 140, alignment: .leading)
+                .padding(.leading, 24)
+
+            Text(RelativeDate.short(row.lastTouched))
+                .font(.system(size: 12.5))
+                .foregroundStyle(BColor.inkSoft)
+                .frame(width: 130, alignment: .leading)
+
+            // Managed verbs stay visible (the mock shows them); the
+            // selectable icon pair rests hidden and reveals on hover, so
+            // rows match the design at rest.
+            rowAction(row)
+                .opacity(selectable && hoveredID != row.id ? 0 : 1)
+                .frame(width: 100, alignment: .trailing)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 9)
+        .background(checked ? BColor.brandSoft : (hoveredID == row.id ? BColor.surface : .clear))
+        .overlay(alignment: .bottom) { Divider().overlay(BColor.hair) }
+        .contentShape(Rectangle())
+        .onHover { hoveredID = $0 ? row.id : (hoveredID == row.id ? nil : hoveredID) }
+        .onTapGesture {
+            // The row is the checkbox (mock): clicking anywhere toggles the
+            // plan, shift-click extends the range like the box itself.
+            if selectable {
+                trayBinding(row).wrappedValue.toggle()
+            }
+        }
+        .contextMenu { contextMenu(ids: [row.id]) }
+        .animation(BMotion.light, value: hoveredID == row.id)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(accessibilityLine(row))
+    }
+
+    private func planCheckbox(checked: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 5, style: .continuous)
+            .fill(checked ? AnyShapeStyle(BColor.brand) : AnyShapeStyle(BColor.surface))
+            .overlay {
+                if checked {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .heavy))
+                        .foregroundStyle(BColor.onBrand)
+                } else {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .strokeBorder(BColor.line, lineWidth: 1.5)
+                }
+            }
+            .frame(width: 18, height: 18)
+    }
+
+    /// The single quiet sub line: what a lens saw plus the short path, or
+    /// just the place itself.
+    private func subLine(_ row: LedgerRow, finding: LensFinding?) -> String {
+        let short = row.path.isEmpty ? nil : displayPath(row.path)
+        if let finding {
+            return [finding.evidenceLine, short].compactMap { $0 }.joined(separator: " · ")
+        }
+        // The mock's density: what it is, then where (identity clause · path).
+        func firstClause(_ line: String) -> String {
+            String(line.split(separator: ".").first.map(String.init) ?? line)
+        }
+        if let item = row.item {
+            return [firstClause(item.entry.identityLine), short].compactMap { $0 }.joined(separator: " · ")
+        }
+        if let insight = row.insight {
+            return firstClause(Atlas.entry(insight.entryID).identityLine)
+        }
+        return short ?? ""
+    }
+
+
+    /// Every row's direct verbs, as real buttons: icon pair for rows Elbowroom
+    /// moves itself, worded pills where another tool or a lesson does the work.
+    @ViewBuilder
+    private func rowAction(_ row: LedgerRow) -> some View {
+        if let item = row.item, model.canSelect(item) {
+            HStack(spacing: 6) {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([item.url])
+                } label: {
+                    Image(systemName: "folder")
+                }
+                .buttonStyle(RowIconButtonStyle())
+                .help(Copy.revealInFinder)
+                .accessibilityLabel(Copy.revealInFinder)
+                Button {
+                    model.openReclaimPlan(items: [item])
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(RowIconButtonStyle())
+                .help(Copy.trayReclaim)
+                .accessibilityLabel(Copy.trayReclaim)
+                if let stash = model.stash, item.entry.stashable, !item.isStashed {
+                    Button {
+                        model.stashItem(item)
+                    } label: {
+                        Image(systemName: "externaldrive")
+                    }
+                    .buttonStyle(RowIconButtonStyle())
+                    .disabled(!stash.volumeIsPresent)
+                    .help(stash.volumeIsPresent ? Copy.trayStash : Copy.stashConnectFirst(stash.volumeName))
+                    .accessibilityLabel(Copy.trayStash)
+                }
+            }
+        } else if let item = row.item,
+                  let tool = ToolCleanup.tool(for: item.entryID),
+                  model.toolsAvailable.contains(tool) {
+            Button(Copy.cleanUp) { model.sheet = .cleanup(entryID: item.entryID) }
+                .buttonStyle(RowActionButtonStyle())
+        } else if let item = row.item, ToolCleanup.directReclaimEntryIDs.contains(item.entryID) {
+            Button(Copy.trayReclaim) { model.openReclaimPlan(items: [item]) }
+                .buttonStyle(RowActionButtonStyle())
+        } else if let item = row.item, let flow = item.entry.teachFlow {
+            Button(Copy.showMe) { model.sheet = .teach(flow, bytes: item.bytes) }
+                .buttonStyle(RowActionButtonStyle())
+        } else if let insight = row.insight, let flow = Atlas.entry(insight.entryID).teachFlow {
+            Button(Copy.showMe) { model.sheet = .teach(flow, bytes: insight.bytes) }
+                .buttonStyle(RowActionButtonStyle())
+        }
+    }
+
+    /// Checkbox binding with range semantics: a plain click toggles one row,
+    /// shift-click extends the clicked state from the last-toggled row across
+    /// everything between, ticking down the range in a brief cascade.
+    private func trayBinding(_ row: LedgerRow) -> Binding<Bool> {
+        Binding(
+            get: { row.item.map { model.trayItems.contains($0) } ?? false },
+            set: { include in
+                let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
+                if shift, let anchor = checkAnchorID, anchor != row.id,
+                   let a = rows.firstIndex(where: { $0.id == anchor }),
+                   let b = rows.firstIndex(where: { $0.id == row.id }) {
+                    applyTray(Array(rows[min(a, b)...max(a, b)]), include: include)
+                } else if let item = row.item, model.trayItems.contains(item) != include {
+                    model.toggleTray(item)
+                }
+                checkAnchorID = row.id
+            }
+        )
+    }
+
+    private func applyTray(_ range: [LedgerRow], include: Bool) {
+        let step: UInt64 = reduceMotion ? 0 : min(25_000_000, 400_000_000 / UInt64(max(range.count, 1)))
+        Task {
+            for row in range {
+                guard let item = row.item, model.canSelect(item),
+                      model.trayItems.contains(item) != include else { continue }
+                model.toggleTray(item)
+                if step > 0 { try? await Task.sleep(nanoseconds: step) }
+            }
+        }
+    }
+
+    private func lensFinding(_ row: LedgerRow) -> LensFinding? {
+        guard row.item?.entryID == "lens.found" else { return nil }
+        return model.lensFindings.first { $0.url.path == row.id }
+    }
+
+    /// Paths render home-relative so they fit whole in the fixed row height.
+    private func displayPath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) { return "~" + path.dropFirst(home.count) }
+        return path
+    }
+
+    private func accessibilityLine(_ row: LedgerRow) -> String {
+        // VoiceOver order: name, size, tier, last touched.
+        var parts = [row.name, ByteFormat.string(row.bytes), row.tier.label]
+        if let touched = row.lastTouched { parts.append(RelativeDate.short(touched)) }
+        return parts.joined(separator: ", ")
+    }
+
+    @ViewBuilder
+    private func contextMenu(ids: Set<LedgerRow.ID>) -> some View {
+        let selected = rows.filter { ids.contains($0.id) }.compactMap(\.item)
+        if !selected.isEmpty {
+            if selected.allSatisfy({ model.canSelect($0) }) {
+                Button(Copy.trayReclaim) {
+                    for item in selected where !model.trayItems.contains(item) {
+                        model.toggleTray(item)
+                    }
+                    model.openReclaimPlan()
+                }
+            }
+            if selected.allSatisfy({ $0.entry.stashable && !$0.isStashed }) {
+                Button(Copy.trayStash) {
+                    for item in selected { model.stashItem(item) }
+                }
+            }
+            if let first = selected.first, selected.count == 1 {
+                Button(Copy.revealInFinder) {
+                    NSWorkspace.shared.activateFileViewerSelecting([first.url])
+                }
+            }
+        }
+        // The trailing action column's verb, mirrored for one row.
+        if ids.count == 1, let row = rows.first(where: { ids.contains($0.id) }) {
+            if let item = row.item, let tool = ToolCleanup.tool(for: item.entryID),
+               model.toolsAvailable.contains(tool) {
+                Button(Copy.cleanUp) { model.sheet = .cleanup(entryID: item.entryID) }
+            } else if let item = row.item, let flow = item.entry.teachFlow,
+                      !model.canSelect(item) {
+                Button(Copy.showMe) { model.sheet = .teach(flow, bytes: item.bytes) }
+            } else if let insight = row.insight,
+                      let flow = Atlas.entry(insight.entryID).teachFlow {
+                Button(Copy.showMe) { model.sheet = .teach(flow, bytes: insight.bytes) }
+            }
+        }
+    }
+}
+
+extension LedgerView.LedgerRow {
+    var sortableDate: Date { lastTouched ?? .distantPast }
+}
+
+/// Every row carries a face at thumbnail scale. App-owned items wear
+/// their app's real icon, genuine files and bundles wear their Finder icon,
+/// and bare folders or insights wear a tier-tinted symbol chip — never a
+/// sea of identical blue folders.
+struct ItemIcon: View {
+    let entryID: String
+    let url: URL?
+    let tier: Tier
+    let owner: String
+    let lensKind: LensKind?
+
+    @State private var image: NSImage?
+    /// Resolution touches the disk and Icon Services, so it runs off-main
+    /// once per key and caches; rows render the chip instantly.
+    private static let cache = NSCache<NSString, NSImage>()
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(tier.color.opacity(0.15))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(tier.color.opacity(0.25), lineWidth: 1)
+                    )
+                    .overlay(
+                        Image(systemName: symbolName)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(tier.color)
+                    )
+            }
+        }
+        .frame(width: 34, height: 34)
+        .accessibilityHidden(true)
+        .task(id: cacheKey) {
+            let key = cacheKey as NSString
+            if let hit = Self.cache.object(forKey: key) { image = hit; return }
+            let resolve = resolvedImage
+            let found = await Task.detached(priority: .utility) { resolve() }.value
+            if let found {
+                Self.cache.setObject(found, forKey: key)
+                image = found
+            }
+        }
+    }
+
+    private var cacheKey: String { entryID + "|" + (url?.path ?? owner) }
+
+    private var resolvedImage: @Sendable () -> NSImage? {
+        let entryID = entryID, url = url, owner = owner, lensKind = lensKind
+        return { Self.resolve(entryID: entryID, url: url, owner: owner, lensKind: lensKind) }
+    }
+
+    private static func resolve(entryID: String, url: URL?, owner: String, lensKind: LensKind?) -> NSImage? {
+        let fm = FileManager.default
+        func app(_ name: String) -> NSImage? {
+            let path = "/Applications/\(name).app"
+            return fm.fileExists(atPath: path) ? NSWorkspace.shared.icon(forFile: path) : nil
+        }
+        // The owning app's icon is the most recognizable face there is.
+        if entryID == "sys.appCache", let url,
+           let icon = app(AppNames.human(fromCacheFolder: url.lastPathComponent)) {
+            return icon
+        }
+        if entryID.hasPrefix("xcode."), let icon = app("Xcode") { return icon }
+        if lensKind == .game, let icon = app("Steam") { return icon }
+        switch owner {
+        case "Docker", "OrbStack", "Ollama": if let icon = app(owner) { return icon }
+        case "Simulator": if let icon = app("Xcode") { return icon }
+        default: break
+        }
+        if let icon = app(owner) { return icon }
+        // Real files and bundles carry their Finder icon; bare folders fall
+        // through to the chip.
+        if let url {
+            var isDirectory: ObjCBool = false
+            if fm.fileExists(atPath: url.path, isDirectory: &isDirectory),
+               !isDirectory.boolValue || !url.pathExtension.isEmpty {
+                return NSWorkspace.shared.icon(forFile: url.path)
+            }
+        }
+        return nil
+    }
+
+    private var symbolName: String {
+        if lensKind != nil, LensFinding.isDownloadsRoot(url) { return "arrow.down.circle" }
+        if let lensKind {
+            switch lensKind {
+            case .vm: return "desktopcomputer"
+            case .weights: return "brain"
+            case .project: return "curlybraces"
+            case .downloads: return "arrow.down.circle"
+            case .ghost: return "clock.arrow.circlepath"
+            case .game: return "gamecontroller"
+            case .installer: return "shippingbox"
+            case .twin: return "doc.on.doc"
+            case .zipShadow: return "doc.zipper"
+            default: return "photo"
+            }
+        }
+        switch entryID {
+        case "sys.iosBackups": return "iphone"
+        case "sys.trash": return "trash"
+        case "sys.purgeable": return "internaldrive"
+        case "sys.snapshots": return "clock.arrow.circlepath"
+        case "xcode.simDevices", "xcode.testDevices", "xcode.simRuntimes": return "iphone"
+        default: break
+        }
+        switch Atlas.entry(entryID).pack {
+        case .xcode: return "hammer"
+        case .javascript: return "cube"
+        case .rust: return "cube.transparent"
+        case .homebrew: return "mug"
+        case .containers: return "shippingbox"
+        case .ml: return "brain"
+        case .systemResidue: return "internaldrive"
+        }
+    }
+}
+
+/// Row verbs in the Ledger's trailing actions column: quiet bordered pill,
+/// TierChip-height, unmistakably a button.
+struct RowActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(BColor.ink)
+            .padding(.horizontal, 8)
+            .frame(height: 22)
+            .background(BColor.surface, in: Capsule())
+            .overlay(Capsule().strokeBorder(BColor.ink.opacity(0.25), lineWidth: 1))
+            .opacity(configuration.isPressed ? 0.7 : 1)
+    }
+}
+
+/// The icon variant for the mechanical pair (Reclaim, Offload): same quiet
+/// bordered language, round, tooltip carries the word.
+struct RowIconButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(isEnabled ? BColor.ink : BColor.inkSoft.opacity(0.5))
+            .frame(width: 22, height: 22)
+            .background(BColor.surface, in: Circle())
+            .overlay(Circle().strokeBorder(BColor.ink.opacity(isEnabled ? 0.25 : 0.12), lineWidth: 1))
+            .opacity(configuration.isPressed ? 0.7 : 1)
+            .contentShape(Circle())
+    }
+}

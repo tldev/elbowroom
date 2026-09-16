@@ -1,0 +1,7 @@
+.build/
+dist/
+Design/snapshots/
+Assets/AppIcon.iconset/
+.DS_Store
+*.xcresult
+.swiftpm/
