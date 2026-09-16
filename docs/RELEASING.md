@@ -20,7 +20,7 @@ release uses the existing `notarytool-dorso` notarytool profile on this Mac;
 its Apple credentials are account-wide, not specific to Dorso. Override with
 `NOTARY_PROFILE=your-profile` or change `notary_profile` in `release.json`.
 Local credentials stay in Keychain. GitHub-hosted releases use encrypted repository
-secrets and a disposable runner Keychain. Never commit passwords or private keys.
+secrets and disposable runner credentials. Never commit passwords or private keys.
 
 Elbowroom uses a separate Sparkle signing key with Keychain account `elbowroom`.
 The setup command creates it only if absent and records its **public** key in
@@ -118,8 +118,10 @@ Repository Actions secrets:
 - `APPLE_APP_PASSWORD`: app-specific password for notarization.
 
 Secrets are used only by the release job on `main`, never by pull-request tests.
-`Scripts/ci-signing.py` imports them into a temporary runner keychain and removes
-that keychain after the job. The workflow uses GitHub's temporary token with
+`Scripts/ci-signing.py` imports the certificate and notarization profile into a
+temporary runner keychain. Sparkle signs with a private key file restricted to
+the runner user, avoiding interactive Keychain prompts. Both are removed after
+the job. The workflow uses GitHub's temporary token with
 `contents: write` to publish; no long-lived GitHub token is needed.
 
 ### Recovery and local fallback

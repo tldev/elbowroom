@@ -61,9 +61,8 @@ def setup():
     run(root / '.build/artifacts/sparkle/Sparkle/bin/generate_keys',
         '--account', meta['sparkle_key_account'], '-f', sparkle)
     certificate.unlink()
-    sparkle.unlink()
     with open(os.environ['GITHUB_ENV'], 'a') as env:
-        env.write(f'NOTARY_KEYCHAIN={keychain}\n')
+        env.write(f'NOTARY_KEYCHAIN={keychain}\nSPARKLE_KEY_FILE={sparkle}\n')
     print('Developer ID, notarization, and Sparkle credentials installed.')
 
 

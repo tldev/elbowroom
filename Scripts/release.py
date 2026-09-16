@@ -232,11 +232,13 @@ def package(meta, preview):
         run('xcrun', 'stapler', 'staple', dmg)
         run('xcrun', 'stapler', 'validate', dmg)
         run('spctl', '--assess', '--type', 'execute', '--verbose=2', app)
-        attrs = run(SPARKLE / 'sign_update', '--account', meta['sparkle_key_account'], archive, capture=True)
+        key_file = os.getenv('SPARKLE_KEY_FILE')
+        key_args = ['--ed-key-file', key_file] if key_file else ['--account', meta['sparkle_key_account']]
+        attrs = run(SPARKLE / 'sign_update', *key_args, archive, capture=True)
         parsed = ET.fromstring(f'<enclosure xmlns:sparkle="{NS}" {attrs}/>')
         if int(parsed.attrib['length']) != archive.stat().st_size:
             raise ValueError('Sparkle signature length does not match the release ZIP.')
-        run(SPARKLE / 'sign_update', '--account', meta['sparkle_key_account'], '--verify',
+        run(SPARKLE / 'sign_update', *key_args, '--verify',
             archive, parsed.attrib[f'{{{NS}}}edSignature'])
         (work / 'appcast.xml').write_text(appcast(meta, parsed.attrib[f'{{{NS}}}edSignature'],
                                                archive.stat().st_size, datetime.now(timezone.utc)))
