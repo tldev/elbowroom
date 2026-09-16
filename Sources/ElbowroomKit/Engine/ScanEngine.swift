@@ -5,7 +5,7 @@ import Foundation
 /// writes. Builds a pruned tree (small children collapse into pebble counts),
 /// classifies against the Atlas during descent, and tracks per-repo staleness.
 
-public enum ScanEvent: @unchecked Sendable {
+public enum ScanEvent: Sendable {
     case progress(itemsScanned: Int, bytesSeen: Int64, currentPath: String)
     case ticker(String)
     case finished(ScanResult)
@@ -26,8 +26,8 @@ public struct SystemInsight: Identifiable, Sendable {
     }
 }
 
-public final class ScanResult: @unchecked Sendable {
-    public let root: ScanNode
+public struct ScanResult: Sendable {
+    public var root: ScanNode
     public var items: [AtlasItem]
     public let repoStaleness: [String: Date]
     public let deniedPaths: [String]
@@ -37,6 +37,8 @@ public final class ScanResult: @unchecked Sendable {
     public let insights: [SystemInsight]
     public let scannedBytes: Int64
     public let classifiedBytes: Int64
+    /// Named allocations measured separately from the file walk.
+    public let outsideWalkBytes: Int64
     public let finishedAt: Date
     /// What the lenses named, part of the one result and its cache.
     public var lensFindings: [LensFinding]
@@ -48,8 +50,9 @@ public final class ScanResult: @unchecked Sendable {
     init(root: ScanNode, items: [AtlasItem], repoStaleness: [String: Date],
          deniedPaths: [String], disk: DiskSnapshot, duration: TimeInterval,
          insights: [SystemInsight], scannedBytes: Int64, classifiedBytes: Int64,
-         finishedAt: Date? = nil, lensFindings: [LensFinding] = []) {
+         finishedAt: Date? = nil, lensFindings: [LensFinding] = [], outsideWalkBytes: Int64 = 0) {
         self.lensFindings = lensFindings
+        self.outsideWalkBytes = outsideWalkBytes
         self.root = root
         self.items = items
         self.repoStaleness = repoStaleness
@@ -66,12 +69,12 @@ public final class ScanResult: @unchecked Sendable {
 public final class ScanEngine {
     public init() {}
 
-    /// Directories never entered when scanning from `/`. `/System/Volumes`
-    /// firmlinks would double-count the Data volume; external volumes are v1
-    /// out of scope; the rest is kernel noise that only yields denials.
+    /// Exclude external volumes, virtual filesystems and sibling volumes
+    /// measured separately. Data-only system directories use the narrow
+    /// traversal policy below so root firmlinks cannot double-count them.
     static let rootSkips: Set<String> = [
-        "/System", "/Volumes", "/dev", "/Network", "/cores",
-        "/private/var/vm", "/private/var/db", "/private/var/folders",
+        "/Volumes", "/dev", "/Network", "/cores", "/bin", "/sbin",
+        "/private/var/vm",
         "/private/var/networkd", "/private/var/protected",
         // Mounted simulator runtime images: their uncompressed contents are
         // not local blocks; the real bytes live in the OS asset store and
@@ -87,19 +90,30 @@ public final class ScanEngine {
 
     /// Bytes below which a child collapses into its parent's pebble count.
     static let keepThreshold: Int64 = 20 * 1_000_000
-    static let maxDepth = 24
+    /// Only Data-only locations are entered through /System. The normal root
+    /// already exposes Applications, Library, Users and private via firmlinks.
+    static let dataOnlyRoots: Set<String> = [
+        "System", "macOS Install Data", "MobileSoftwareUpdate",
+        ".PreviousSystemInformation", ".DocumentRevisions-V100",
+        ".Spotlight-V100", ".fseventsd"
+    ]
 
-    private final class RepoContext {
-        let name: String
-        let path: String
-        let marker: String
-        let node: ScanNode
-        var maxSourceMTime: Date?
-        init(name: String, path: String, marker: String, node: ScanNode) {
-            self.name = name
-            self.path = path
-            self.marker = marker
-            self.node = node
+    static func shouldSkip(path: String) -> Bool {
+        if rootSkips.contains(path) { return true }
+        let parent = (path as NSString).deletingLastPathComponent
+        switch parent {
+        // Sealed /usr content is included in the measured System volume.
+        // These are the Data firmlinks declared in /usr/share/firmlinks.
+        case "/usr": return !["/usr/local", "/usr/libexec", "/usr/share"].contains(path)
+        case "/usr/libexec": return path != "/usr/libexec/cups"
+        case "/usr/share": return path != "/usr/share/snmp"
+        case "/System": return path != "/System/Volumes"
+        case "/System/Volumes": return path != "/System/Volumes/Data"
+        case "/System/Volumes/Data":
+            return !dataOnlyRoots.contains((path as NSString).lastPathComponent)
+        default:
+            // Runtime images have a separate measurement pass.
+            return path == "/System/Volumes/Data" + runtimeAssetStore
         }
     }
 
@@ -111,10 +125,6 @@ public final class ScanEngine {
         "go.mod": 4, "pyproject.toml": 5, "package.json": 6,
     ]
     static let projectMarkerLabels = ["Git", "Xcode", "Rust", "Swift", "Go", "Python", "JavaScript"]
-
-    static func projectMarker(in contents: [URL]) -> String? {
-        projectMarker(names: contents.lazy.map { $0.lastPathComponent })
-    }
 
     static func projectMarker(names: some Sequence<String>) -> String? {
         var best = Int.max
@@ -129,265 +139,13 @@ public final class ScanEngine {
         return best == .max ? nil : projectMarkerLabels[best]
     }
 
-    private final class ScanState {
-        var itemsScanned = 0
-        var bytesSeen: Int64 = 0
-        var denied: [String] = []
-        var items: [AtlasItem] = []
-        var repos: [String: RepoContext] = [:]
-        var itemRepo: [String: String] = [:] // item path -> repo path
-        var tickeredEntries: Set<String> = []
-        /// Lens facts gathered during the same walk, capped; the lens
-        /// detectors run as a post-pass, never a second walk.
-        var facts: [FileFact] = []
-        var lastProgressReport = 0
-    }
-
     /// Run a scan. Events stream out; the stream finishes after `.finished`.
-    ///
-    /// The default path is the parallel bulk walk (BulkWalk.swift): same
-    /// semantics, several times faster. ELBOWROOM_SCAN_LEGACY=1 selects this
-    /// serial walk, kept as the reference for A/B equivalence checks.
     public func scan(root: URL, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> AsyncThrowingStream<ScanEvent, Error> {
-        if ProcessInfo.processInfo.environment["ELBOWROOM_SCAN_LEGACY"] != "1" {
-            return AsyncThrowingStream { continuation in
-                let job = ParallelScanJob(root: root, home: home, continuation: continuation)
-                job.start()
-                continuation.onTermination = { _ in job.cancel() }
-            }
+        AsyncThrowingStream { continuation in
+            let job = ParallelScanJob(root: root, home: home, continuation: continuation)
+            continuation.onTermination = { _ in job.cancel() }
+            job.start()
         }
-        return AsyncThrowingStream { continuation in
-            let task = Task.detached(priority: .userInitiated) {
-                let started = Date()
-                let state = ScanState()
-                let rootPath = root.standardizedFileURL.path
-                let homePath = home.standardizedFileURL.path
-                let rootNode = ScanNode(url: root.standardizedFileURL, isDirectory: true, parent: nil)
-                do {
-                    try self.walk(
-                        node: rootNode, depth: 0, homePath: homePath,
-                        repo: nil, colonyEntry: nil, lensEligible: rootPath == homePath,
-                        state: state, continuation: continuation
-                    )
-                    rootNode.sortChildren()
-                    var items = state.items
-                    self.applyRepoStaleness(&items, state: state)
-                    items.append(contentsOf: Self.genericCacheItems(homePath: homePath, root: rootNode, known: items))
-                    items.append(contentsOf: Self.brewOldVersionItems(root: rootNode))
-                    Self.addRuntimeAssetBytes(to: &items)
-                    Self.mergeSimulatorItems(&items, homePath: homePath)
-                    let disk = DiskSnapshot.capture()
-                    // Snapshots ride the items list like everything else;
-                    // the insight remains only for snapshot-free purgeable
-                    // space.
-                    let (snapshotItem, insights) = TMSnapshotCleanup.scanArtifacts(disk: disk)
-                    if let snapshotItem { items.append(snapshotItem) }
-                    items.sort { $0.bytes != $1.bytes ? $0.bytes > $1.bytes : $0.id < $1.id }
-                    let classified = items.reduce(Int64(0)) { $0 + $1.bytes }
-                    let seeds = state.repos.values.map {
-                        Lens.ProjectSeed(path: $0.path, marker: $0.marker,
-                                         bytes: $0.node.allocatedBytes,
-                                         sourceTouched: $0.maxSourceMTime,
-                                         fallbackTouched: $0.node.lastTouched)
-                    }
-                    let findings = Self.lensFindings(
-                        facts: state.facts, homePath: homePath, root: rootNode,
-                        projects: seeds, classified: items.map { ($0.id, $0.bytes) }
-                    )
-                    let result = ScanResult(
-                        root: rootNode, items: items,
-                        repoStaleness: state.repos.mapValues { $0.maxSourceMTime ?? Date.distantPast }
-                            .reduce(into: [:]) { $0[$1.key] = $1.value },
-                        deniedPaths: state.denied, disk: disk,
-                        duration: Date().timeIntervalSince(started),
-                        insights: insights,
-                        scannedBytes: state.bytesSeen,
-                        classifiedBytes: min(classified, state.bytesSeen),
-                        lensFindings: findings
-                    )
-                    _ = rootPath
-                    continuation.yield(.finished(result))
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-
-    /// Keep this set lean: `.isUbiquitousItemKey` (and friends) drag the
-    /// FileProvider framework into EVERY item lookup, a statfs per file that
-    /// multiplies scan time by an order of magnitude on real disks. Dataless
-    /// detection uses the allocated-vs-logical gap instead, which is free.
-    private static let childKeys: [URLResourceKey] = [
-        .isDirectoryKey, .isSymbolicLinkKey,
-        .totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .fileSizeKey,
-        .contentModificationDateKey,
-    ]
-
-    private func walk(
-        node: ScanNode, depth: Int, homePath: String,
-        repo: RepoContext?, colonyEntry: String?, lensEligible: Bool = false,
-        state: ScanState, continuation: AsyncThrowingStream<ScanEvent, Error>.Continuation
-    ) throws {
-        try Task.checkCancellation()
-        let fm = FileManager.default
-        let path = node.path
-
-        let contents: [URL]
-        do {
-            contents = try fm.contentsOfDirectory(
-                at: node.url, includingPropertiesForKeys: Self.childKeys,
-                options: []
-            )
-        } catch {
-            state.denied.append(path)
-            return
-        }
-
-        var repo = repo
-        if depth > 0, colonyEntry == nil, let marker = Self.projectMarker(in: contents) {
-            let ctx = RepoContext(name: node.name, path: path, marker: marker, node: node)
-            state.repos[path] = ctx
-            repo = ctx
-        }
-
-        var maxMTime: Date?
-        for child in contents {
-            try Task.checkCancellation()
-            let childPath = child.path
-            if depth == 0 {
-                if Self.rootSkips.contains(childPath) { continue }
-                if node.path == "/" && child.lastPathComponent.hasPrefix(".") { continue }
-            }
-            if Self.rootSkips.contains(childPath) { continue }
-
-            guard let rv = try? child.resourceValues(forKeys: Set(Self.childKeys)) else { continue }
-
-            if rv.isSymbolicLink == true {
-                // Never follow symlinks out of scope. A stashed folder is a
-                // symlink at its old address; it counts on the Stash side, not here.
-                state.itemsScanned += 1
-                continue
-            }
-
-            if rv.isDirectory == true {
-                let childNode = ScanNode(url: child, isDirectory: true, parent: node)
-                var childColony = colonyEntry
-                if childColony == nil {
-                    let matched = Atlas.classify(path: childPath, home: homePath)
-                        ?? Atlas.classify(name: child.lastPathComponent, parentPath: path, home: homePath)
-                    if let matched {
-                        childNode.atlasEntryID = matched
-                        childColony = matched
-                    }
-                }
-                // Lens territory is the unclassified home tree: on at the
-                // home folder, off inside ~/Library, .Trash, app-sealed
-                // libraries, and anything the Atlas claims.
-                let lowerName = child.lastPathComponent.lowercased()
-                let childEligible: Bool
-                if lensEligible {
-                    childEligible = childColony == nil
-                        && !(node.path == homePath && (lowerName == "library" || lowerName == ".trash"))
-                        && !LensPass.sealedSuffixes.contains { lowerName.hasSuffix($0) }
-                } else {
-                    childEligible = childPath == homePath
-                }
-                if depth < Self.maxDepth {
-                    // Dot directories (.git, .vscode, .venv) churn without a
-                    // human working there; their mtimes never speak for the
-                    // project's sources.
-                    let carriesStaleness = childNode.atlasEntryID == nil && !lowerName.hasPrefix(".")
-                    try walk(node: childNode, depth: depth + 1, homePath: homePath,
-                             repo: carriesStaleness ? repo : nil,
-                             colonyEntry: childColony, lensEligible: childEligible,
-                             state: state, continuation: continuation)
-                }
-                if childEligible, state.facts.count < 400_000 {
-                    state.facts.append(FileFact(
-                        path: childPath, bytes: childNode.allocatedBytes,
-                        modified: childNode.lastTouched ?? .distantPast, isDirectory: true
-                    ))
-                }
-                node.allocatedBytes += childNode.allocatedBytes
-                node.collapsedCount += 0
-
-                if let entryID = childNode.atlasEntryID {
-                    var item = AtlasItem(
-                        entryID: entryID, url: child, bytes: childNode.allocatedBytes,
-                        lastTouched: childNode.lastTouched,
-                        projectName: repo?.name
-                    )
-                    if let repo { state.itemRepo[item.id] = repo.path }
-                    if let dot = childNode.lastTouched, let m = maxMTime, dot > m { maxMTime = dot }
-                    state.items.append(item)
-                    childNode.projectName = repo?.name
-                    self.emitTickerIfNeeded(for: &item, state: state, continuation: continuation)
-                }
-
-                // Prune: small children collapse into the pebble pile.
-                if childNode.allocatedBytes >= Self.keepThreshold || depth < 1 || childNode.atlasEntryID != nil {
-                    node.children.append(childNode)
-                } else {
-                    node.collapsedCount += 1 + childNode.collapsedCount + childNode.children.count
-                    node.collapsedBytes += childNode.allocatedBytes
-                }
-                if let ct = childNode.lastTouched {
-                    if maxMTime == nil || ct > maxMTime! { maxMTime = ct }
-                }
-            } else {
-                let logical = Int64(rv.fileSize ?? 0)
-                let allocated = Int64(rv.totalFileAllocatedSize ?? rv.fileAllocatedSize ?? 0)
-                // Dataless (cloud-evicted) files show a large logical size but
-                // near-zero allocation; they count at local bytes and are never
-                // suggested for reclaim (edge matrix).
-                if logical > 65_536, allocated < logical / 8 {
-                    node.isDataless = true
-                }
-                node.allocatedBytes += allocated
-                state.bytesSeen += allocated
-                state.itemsScanned += 1
-                if lensEligible, colonyEntry == nil, allocated >= 262_144, state.facts.count < 400_000 {
-                    state.facts.append(FileFact(
-                        path: childPath, bytes: allocated,
-                        modified: rv.contentModificationDate ?? .distantPast, isDirectory: false
-                    ))
-                }
-                if let mt = rv.contentModificationDate {
-                    if maxMTime == nil || mt > maxMTime! { maxMTime = mt }
-                    // Source files update repo staleness; artifact colonies do not.
-                    if let repo, colonyEntry == nil {
-                        if repo.maxSourceMTime == nil || mt > repo.maxSourceMTime! {
-                            repo.maxSourceMTime = mt
-                        }
-                    }
-                }
-            }
-
-            if state.itemsScanned - state.lastProgressReport >= 3000 {
-                state.lastProgressReport = state.itemsScanned
-                continuation.yield(.progress(
-                    itemsScanned: state.itemsScanned,
-                    bytesSeen: state.bytesSeen,
-                    currentPath: childPath
-                ))
-            }
-        }
-        node.lastTouched = maxMTime
-    }
-
-    private func emitTickerIfNeeded(
-        for item: inout AtlasItem, state: ScanState,
-        continuation: AsyncThrowingStream<ScanEvent, Error>.Continuation
-    ) {
-        guard item.bytes >= 500 * 1_000_000,
-              !state.tickeredEntries.contains(item.entryID),
-              let template = item.entry.ticker
-        else { return }
-        state.tickeredEntries.insert(item.entryID)
-        continuation.yield(.ticker(template(ByteFormat.string(item.bytes))))
     }
 
     /// Post-pass: the runtimes row tells the whole truth — dyld caches the
@@ -432,9 +190,18 @@ public final class ScanEngine {
     /// Post-pass: the lens detectors over facts the walk gathered.
     /// Pure functions; the walk is the only disk pass. Ghost aggregates come
     /// straight from the tree's home children.
-    static func lensFindings(facts: [FileFact], homePath: String, root: ScanNode,
+    static func lensFindings(facts: [FileFact], homePath: String, root: ScanNodeBuilder,
                              projects: [Lens.ProjectSeed] = [],
                              classified: [(path: String, bytes: Int64)] = []) -> [LensFinding] {
+        let namedPaths = Set(classified.map(\.path))
+        let facts = facts.filter { fact in
+            var path = fact.path
+            while path != "/" && !path.isEmpty {
+                if namedPaths.contains(path) { return false }
+                path = (path as NSString).deletingLastPathComponent
+            }
+            return true
+        }
         let downloads = homePath + "/Downloads"
         var findings: [LensFinding] = []
         findings += Lens.mediaHoards(facts, downloads: downloads)
@@ -461,9 +228,9 @@ public final class ScanEngine {
         return findings.sorted { $0.kind == $1.kind ? $0.bytes > $1.bytes : $0.kind < $1.kind }
     }
 
-    /// Post-pass (System residue): any unrecognized app cache over 1 GB
+    /// Post-pass (System residue): every retained unrecognized app cache
     /// under ~/Library/Caches becomes its own regenerable item.
-    static func genericCacheItems(homePath: String, root: ScanNode, known: [AtlasItem]) -> [AtlasItem] {
+    static func genericCacheItems(homePath: String, root: ScanNodeBuilder, known: [AtlasItem]) -> [AtlasItem] {
         let cachesPath = homePath + "/Library/Caches"
         guard let cachesNode = staticFindNode(path: cachesPath, under: root) else { return [] }
         let knownPaths = Set(known.map(\.id))
@@ -471,7 +238,7 @@ public final class ScanEngine {
             guard child.isDirectory,
                   child.atlasEntryID == nil,
                   !knownPaths.contains(child.path),
-                  child.allocatedBytes >= 1_000_000_000
+                  child.allocatedBytes > 0
             else { return nil }
             child.atlasEntryID = "sys.appCache"
             return AtlasItem(
@@ -486,7 +253,7 @@ public final class ScanEngine {
     /// teach flow is `brew cleanup`; Elbowroom never deletes inside the Cellar.
     /// Version ordering is numeric on the directory name; bytes are a lower
     /// bound (versions small enough to be pruned from the tree are unseen).
-    static func brewOldVersionItems(root: ScanNode) -> [AtlasItem] {
+    static func brewOldVersionItems(root: ScanNodeBuilder) -> [AtlasItem] {
         var out: [AtlasItem] = []
         for cellarPath in ["/opt/homebrew/Cellar", "/usr/local/Cellar"] {
             guard let cellar = staticFindNode(path: cellarPath, under: root) else { continue }
@@ -515,31 +282,12 @@ public final class ScanEngine {
         return out
     }
 
-    static func staticFindNode(path: String, under node: ScanNode) -> ScanNode? {
+    static func staticFindNode(path: String, under node: ScanNodeBuilder) -> ScanNodeBuilder? {
         if node.path == path { return node }
         guard path.hasPrefix(node.path == "/" ? "/" : node.path + "/") else { return nil }
         for child in node.children {
             if let found = staticFindNode(path: path, under: child) { return found }
         }
         return nil
-    }
-
-    private func findNode(path: String, under node: ScanNode) -> ScanNode? {
-        if node.path == path { return node }
-        guard path.hasPrefix(node.path) else { return nil }
-        for child in node.children {
-            if let found = findNode(path: path, under: child) { return found }
-        }
-        return nil
-    }
-
-    private func applyRepoStaleness(_ items: inout [AtlasItem], state: ScanState) {
-        for i in items.indices {
-            if let repoPath = state.itemRepo[items[i].id],
-               let repo = state.repos[repoPath],
-               let stale = repo.maxSourceMTime {
-                items[i].lastTouched = stale
-            }
-        }
     }
 }

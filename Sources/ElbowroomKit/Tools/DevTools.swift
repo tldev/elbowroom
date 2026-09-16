@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // Tool-mediated cleanup. Where a teach flow's command can
 // run safely as the logged-in user, Elbowroom runs it itself: preview first from
@@ -17,18 +18,6 @@ public enum DevTool: String, Sendable, CaseIterable {
 /// argv that removes it. Titles carry data (device names, versions); the
 /// surrounding copy comes from the deck.
 public struct ToolAction: Identifiable, Sendable {
-    /// A verified file copy performed before argv runs (runtime offload:
-    /// image to the drive first, delete second). The copy is checked byte
-    /// for byte against the source before the delete may proceed.
-    public struct PreCopy: Sendable {
-        public let from: String
-        public let to: String
-        public init(from: String, to: String) {
-            self.from = from
-            self.to = to
-        }
-    }
-
     public let id: String
     public let title: String
     public let detail: String?
@@ -36,7 +25,6 @@ public struct ToolAction: Identifiable, Sendable {
     public let argv: [String]
     public var checked: Bool
     public var warning: String?
-    public var preCopy: PreCopy?
     /// Consecutive actions sharing a group title render under one tri-state
     /// header that checks the whole set at once; the warning then speaks once
     /// from the header instead of repeating per row.
@@ -44,7 +32,7 @@ public struct ToolAction: Identifiable, Sendable {
 
     public init(id: String, title: String, detail: String?, bytes: Int64,
                 argv: [String], checked: Bool, warning: String? = nil,
-                preCopy: PreCopy? = nil, groupTitle: String? = nil) {
+                groupTitle: String? = nil) {
         self.id = id
         self.title = title
         self.detail = detail
@@ -52,7 +40,6 @@ public struct ToolAction: Identifiable, Sendable {
         self.argv = argv
         self.checked = checked
         self.warning = warning
-        self.preCopy = preCopy
         self.groupTitle = groupTitle
     }
 }
@@ -85,15 +72,9 @@ public struct CleanupPlan: Sendable {
     public var checkedBytes: Int64 { checkedActions.reduce(0) { $0 + $1.bytes } }
     /// The literal lines Elbowroom will run, exactly as a terminal would take them.
     public var commandPreview: String {
-        checkedActions.flatMap { action -> [String] in
-            var lines: [String] = []
-            if let copy = action.preCopy {
-                lines.append("cp \"\(copy.from)\" \"\(copy.to)\"")
-            }
-            lines.append(ToolRunner.displayCommand(tool, action.argv).joined(separator: " "))
-            return lines
-        }
-        .joined(separator: "\n")
+        checkedActions
+            .map { ToolRunner.displayCommand(tool, $0.argv).joined(separator: " ") }
+            .joined(separator: "\n")
     }
 }
 
@@ -112,13 +93,11 @@ public enum ToolRunner {
     public enum RunError: LocalizedError {
         case notInstalled
         case timedOut
-        case failed(String)
 
         public var errorDescription: String? {
             switch self {
             case .notInstalled: Copy.toolMissing
             case .timedOut: Copy.toolTimedOut
-            case .failed(let line): line
             }
         }
     }
@@ -176,32 +155,49 @@ public enum ToolRunner {
 
     public static func run(_ tool: DevTool, _ args: [String], timeout: TimeInterval) async throws -> Output {
         guard let bin = binary(for: tool) else { throw RunError.notInstalled }
+        return try await run(executable: URL(fileURLWithPath: bin), args: args, timeout: timeout)
+    }
+
+    static func run(executable: URL, args: [String], timeout: TimeInterval) async throws -> Output {
         return try await Task.detached(priority: .userInitiated) {
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: bin)
+            process.executableURL = executable
             process.arguments = args
             let out = Pipe(), err = Pipe()
             process.standardOutput = out
             process.standardError = err
             try process.run()
 
-            let deadline = DispatchWorkItem { process.terminate() }
+            let timedOut = OSAllocatedUnfairLock(initialState: false)
+            let deadline = DispatchWorkItem {
+                guard process.isRunning else { return }
+                timedOut.withLock { $0 = true }
+                process.terminate()
+            }
             DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
+            defer { deadline.cancel() }
 
-            // Drain both pipes before waiting, or a chatty tool deadlocks.
-            let stdout = out.fileHandleForReading.readDataToEndOfFile()
-            let stderr = err.fileHandleForReading.readDataToEndOfFile()
+            // Drain concurrently: stderr can fill while stdout is still open.
+            async let stdoutData = readOutput(from: out)
+            async let stderrData = readOutput(from: err)
+            let (stdout, stderr) = await (stdoutData, stderrData)
             process.waitUntilExit()
-            let expired = deadline.isCancelled == false && process.terminationReason == .uncaughtSignal
-            deadline.cancel()
 
-            if expired { throw RunError.timedOut }
+            if timedOut.withLock({ $0 }) { throw RunError.timedOut }
             return Output(
                 stdout: stdout,
                 stderr: String(data: stderr, encoding: .utf8) ?? "",
                 status: process.terminationStatus
             )
         }.value
+    }
+
+    private static func readOutput(from pipe: Pipe) async -> Data {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: pipe.fileHandleForReading.readDataToEndOfFile())
+            }
+        }
     }
 
     /// The literal command a preview shows for an argv this runner executes.
@@ -214,29 +210,6 @@ public enum ToolRunner {
         }
     }
 
-    /// Copy a file off-main and verify its byte count against the source
-    /// before the caller may destroy the original. A failed or short copy is
-    /// removed so the drive never holds a silent partial.
-    public static func copyFileVerified(from: String, to: String) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            let fm = FileManager.default
-            let dir = (to as NSString).deletingLastPathComponent
-            try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            if fm.fileExists(atPath: to) { try fm.removeItem(atPath: to) }
-            do {
-                try fm.copyItem(atPath: from, toPath: to)
-                let src = try fm.attributesOfItem(atPath: from)[.size] as? Int64
-                let dst = try fm.attributesOfItem(atPath: to)[.size] as? Int64
-                guard let src, let dst, src == dst else {
-                    try? fm.removeItem(atPath: to)
-                    throw RunError.failed(Copy.verifyFail)
-                }
-            } catch {
-                try? fm.removeItem(atPath: to)
-                throw error
-            }
-        }.value
-    }
 }
 
 // MARK: - simctl
@@ -332,16 +305,12 @@ public enum SimCleanup {
 
     /// Runtime rows only (the `xcode.simRuntimes` entry). Superseded runtimes
     /// get plain delete rows (re-downloadable, nothing worth keeping). The
-    /// current runtime per platform gets an offload row when a drive can hold
-    /// a verified copy of its image: copy first, delete second, add back
-    /// later with `simctl runtime add` and no download. `kept` names what
-    /// stays with no row at all, so the sheet reconciles against the scanned
-    /// size instead of silently under-delivering.
+    /// current runtime per platform is still the user's to delete: offered
+    /// unchecked with the cost stated plainly, never a locked door. `kept`
+    /// names what stays with no row at all, so the sheet reconciles against
+    /// the scanned size instead of silently under-delivering.
     public static func runtimePlan(
-        runtimes: [SimctlParser.Runtime],
-        offloadDir: String? = nil,
-        driveName: String? = nil,
-        canReadImage: (String) -> Bool = { FileManager.default.isReadableFile(atPath: $0) }
+        runtimes: [SimctlParser.Runtime]
     ) -> (actions: [ToolAction], kept: [SimctlParser.Runtime]) {
         var actions: [ToolAction] = []
         var kept: [SimctlParser.Runtime] = []
@@ -359,33 +328,15 @@ public enum SimCleanup {
                     checked: true
                 ))
             }
-            if let offloadDir, let driveName,
-               let image = newest.imagePath, canReadImage(image) {
-                let name = "\(shortPlatform(newest.identifier)) \(newest.version) (\(newest.build)).dmg"
-                actions.append(ToolAction(
-                    id: "sim.offload.\(newest.uuid ?? newest.identifier)",
-                    title: "\(shortPlatform(newest.identifier)) \(newest.version) (\(newest.build))",
-                    detail: Copy.runtimeOffloadDetail(driveName),
-                    bytes: newest.sizeBytes ?? 0,
-                    argv: ["simctl", "runtime", "delete", newest.uuid ?? newest.identifier],
-                    checked: false,
-                    warning: Copy.runtimeCurrentWarning,
-                    preCopy: ToolAction.PreCopy(from: image, to: offloadDir + "/" + name)
-                ))
-            } else {
-                // The current runtime is still the user's to delete: offered
-                // unchecked with the cost stated plainly, never a locked
-                // door.
-                actions.append(ToolAction(
-                    id: "sim.runtime.current.\(newest.uuid ?? newest.identifier)",
-                    title: "\(shortPlatform(newest.identifier)) \(newest.version) (\(newest.build))",
-                    detail: Copy.runtimeCurrentDetail(ByteFormat.string(newest.sizeBytes ?? 0)),
-                    bytes: newest.sizeBytes ?? 0,
-                    argv: ["simctl", "runtime", "delete", newest.uuid ?? newest.identifier],
-                    checked: false,
-                    warning: Copy.runtimeCurrentWarning
-                ))
-            }
+            actions.append(ToolAction(
+                id: "sim.runtime.current.\(newest.uuid ?? newest.identifier)",
+                title: "\(shortPlatform(newest.identifier)) \(newest.version) (\(newest.build))",
+                detail: Copy.runtimeCurrentDetail(ByteFormat.string(newest.sizeBytes ?? 0)),
+                bytes: newest.sizeBytes ?? 0,
+                argv: ["simctl", "runtime", "delete", newest.uuid ?? newest.identifier],
+                checked: false,
+                warning: Copy.runtimeCurrentWarning
+            ))
         }
         kept.append(contentsOf: runtimes.filter { !$0.deletable })
         return (actions.sorted { $0.bytes > $1.bytes }, kept)
@@ -415,29 +366,11 @@ public enum SimCleanup {
         return total
     }
 
-    /// Runtime images already resting on the drive become add-back rows:
-    /// `simctl runtime add` stages, verifies, and mounts with no download.
-    public static func addBackActions(imagePaths: [String], driveName: String) -> [ToolAction] {
-        imagePaths.sorted().map { path in
-            let name = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-            let attrs = try? FileManager.default.attributesOfItem(atPath: path)
-            return ToolAction(
-                id: "sim.addback.\(path)",
-                title: name,
-                detail: Copy.runtimeAddBack(driveName),
-                bytes: (attrs?[.size] as? Int64) ?? 0,
-                argv: ["simctl", "runtime", "add", path],
-                checked: false
-            )
-        }
-    }
-
     /// Device rows only (the `xcode.simDevices` entry): unavailable devices
-    /// roll into one `delete unavailable`; available devices unbooted past
-    /// the cutoff get their own rows. `keptCount` = devices left alone.
+    /// roll into one `delete unavailable`; available, shut-down devices
+    /// get their own unchecked rows. `keptCount` = devices left alone.
     public static func devicePlan(
-        devices: [SimctlParser.Device],
-        staleCutoff: Date
+        devices: [SimctlParser.Device]
     ) -> (actions: [ToolAction], keptCount: Int) {
         var actions: [ToolAction] = []
         var keptCount = 0
@@ -456,22 +389,13 @@ public enum SimCleanup {
         }
 
         for device in devices where device.isAvailable {
-            let stale: Bool
-            let detail: String
-            if let booted = device.lastBootedAt {
-                stale = booted < staleCutoff
-                detail = RelativeDate.staleness(booted)
-            } else {
-                stale = true
-                detail = Copy.simNeverBooted
-            }
+            let detail = device.lastBootedAt.map { RelativeDate.staleness($0) } ?? Copy.simNeverBooted
             // Every device is offered; only a booted one waits,
             // since simctl cannot delete it mid-run.
             guard device.state != "Booted" else {
                 keptCount += 1
                 continue
             }
-            _ = stale
             actions.append(ToolAction(
                 id: "sim.device.\(device.udid)",
                 title: device.name,
@@ -517,20 +441,6 @@ public enum DockerCleanup {
                   let reclaimable = raw["Reclaimable"] as? String
             else { continue }
             out[type] = parseHumanBytes(reclaimable)
-        }
-        return out
-    }
-
-    /// Total Size per type from the same df output, for reconciliation.
-    public static func dfSizes(fromOutput text: String) -> [String: Int64] {
-        var out: [String: Int64] = [:]
-        for line in text.split(separator: "\n") {
-            guard let data = line.data(using: .utf8),
-                  let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let type = raw["Type"] as? String,
-                  let size = raw["Size"] as? String
-            else { continue }
-            out[type] = parseHumanBytes(size)
         }
         return out
     }

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Synthesize Elbowroom's five sounds: pebble, whoomp, pour, tuck,
-heads-up. Organic/felt palette: filtered noise bursts and soft sine thumps,
-high-passed feel, short, quiet. Pure-stdlib WAV output."""
+"""Synthesize Elbowroom's generated sounds: pebble, whoomp, tuck, heads-up.
+Organic/felt palette: filtered noise bursts and soft sine thumps,
+high-passed feel, short, quiet. Pure-stdlib WAV output.
+The reclaim sound (whoosh.mp3) is a licensed external asset, not generated."""
 import math
 import random
 import struct
@@ -81,19 +82,8 @@ whoomp = mix(
 )
 write_wav("whoomp", whoomp)
 
-# pour: grain trickling into a jar, brightening as it fills. ~850 ms.
-n = int(0.85 * RATE)
-pour = [0.0] * n
-for g in range(260):
-    t0 = int((g / 260) ** 0.8 * (n - 900))
-    f = 900 + 1400 * (g / 260) + random.uniform(-150, 150)
-    grain = env_exp(sine(f, 0.02), 0.004)
-    amp = 0.25 + 0.5 * (g / 260)
-    for i, s in enumerate(grain):
-        if t0 + i < n:
-            pour[t0 + i] += s * amp * random.uniform(0.4, 1.0)
-pour = mix(pour, [s * 0.25 for s in env_exp(hp_noise(0.85, 0.25), 0.5)])
-write_wav("pour", pour)
+# pour (grain trickling into a jar) retired 2026-07: the reclaim moment
+# now plays whoosh.mp3, a licensed external asset dropped in by hand.
 
 # tuck: two soft felt steps, like something settled into place. ~260 ms.
 step1 = env_exp(sine(420, 0.09, glide=0.7), 0.03)

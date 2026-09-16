@@ -2,23 +2,21 @@ import Foundation
 
 /// The Update Planner. Plan composition is greedy in order:
 /// (1) Regenerable, staleness desc; (2) Rebuildable with staleness > 30 d,
-/// cost asc; (3) Stash suggestions if a Stash exists; stop at need × 1.15.
+/// cost asc; stop at need × 1.15.
 /// Managed items are listed with teach links but never counted in the promise.
 public struct UpdatePlan {
     public let neededBytes: Int64
     public let reclaimItems: [AtlasItem]
-    public let stashSuggestions: [AtlasItem]
     /// Managed items shown alongside, promise excluded.
     public let teachItems: [AtlasItem]
 
     public var promisedBytes: Int64 {
-        reclaimItems.reduce(0) { $0 + $1.bytes } + stashSuggestions.reduce(0) { $0 + $1.bytes }
+        reclaimItems.reduce(0) { $0 + $1.bytes }
     }
     public var meetsNeed: Bool { promisedBytes >= neededBytes }
-    /// Rough runtime: a rename is instant; a stash move runs at drive speed.
-    public func estimatedMinutes(stashBytesPerSecond: Double = 400_000_000) -> Int {
-        let stashBytes = stashSuggestions.reduce(Int64(0)) { $0 + $1.bytes }
-        let seconds = Double(stashBytes) / max(stashBytesPerSecond, 50_000_000) + Double(reclaimItems.count) * 2
+    /// Rough runtime: a rename is instant, so the count is the cost.
+    public func estimatedMinutes() -> Int {
+        let seconds = Double(reclaimItems.count) * 2
         return max(1, Int((seconds / 60).rounded(.up)))
     }
 }
@@ -27,7 +25,6 @@ public enum UpdatePlanner {
     public static func compose(
         need: Int64,
         items: [AtlasItem],
-        hasStash: Bool,
         now: Date = Date()
     ) -> UpdatePlan {
         let target = Int64(Double(need) * 1.15)
@@ -44,7 +41,7 @@ public enum UpdatePlanner {
 
         // (1) Regenerable, stalest first.
         let regen = items
-            .filter { $0.entry.tier == .regenerable && !$0.isStashed }
+            .filter { $0.entry.tier == .regenerable }
             .sorted { ($0.lastTouched ?? .distantPast) < ($1.lastTouched ?? .distantPast) }
         take(regen)
 
@@ -52,23 +49,9 @@ public enum UpdatePlanner {
         if total < target {
             let cutoff = now.addingTimeInterval(-30 * 86_400)
             let rebuild = items
-                .filter { $0.entry.tier == .rebuildable && !$0.isStashed && ($0.lastTouched ?? .distantPast) < cutoff }
+                .filter { $0.entry.tier == .rebuildable && ($0.lastTouched ?? .distantPast) < cutoff }
                 .sorted { costRank($0) < costRank($1) }
             take(rebuild)
-        }
-
-        // (3) Stash suggestions when a Stash exists.
-        var stashPicks: [AtlasItem] = []
-        if total < target, hasStash {
-            let pickedIDs = Set(picked.map(\.id))
-            let stashable = items
-                .filter { $0.entry.stashable && !$0.isStashed && !pickedIDs.contains($0.id) }
-                .sorted { $0.bytes > $1.bytes }
-            for item in stashable {
-                guard total < target else { break }
-                stashPicks.append(item)
-                total += item.bytes
-            }
         }
 
         let teach = items
@@ -78,7 +61,6 @@ public enum UpdatePlanner {
         return UpdatePlan(
             neededBytes: need,
             reclaimItems: picked,
-            stashSuggestions: stashPicks,
             teachItems: Array(teach.prefix(3))
         )
     }

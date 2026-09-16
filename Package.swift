@@ -10,6 +10,8 @@ let package = Package(
         .executable(name: "Elbowroom", targets: ["Elbowroom"]),
     ],
     targets: [
+        .target(name: "AuthorizedAppMoveCore"),
+        .executableTarget(name: "ElbowroomAppMover", dependencies: ["AuthorizedAppMoveCore"]),
         .target(
             name: "ElbowroomKit",
             path: "Sources/ElbowroomKit",
@@ -32,7 +34,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ElbowroomTests",
-            dependencies: ["ElbowroomKit"],
+            dependencies: ["ElbowroomKit", "AuthorizedAppMoveCore"],
             path: "Tests/ElbowroomTests"
         ),
     ]

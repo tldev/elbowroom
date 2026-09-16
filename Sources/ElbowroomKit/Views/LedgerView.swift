@@ -5,193 +5,22 @@ import SwiftUI
 public struct LedgerView: View {
     @Environment(AppModel.self) private var model
     @State private var hoveredID: LedgerRow.ID?
-    @State private var sortField: SortField = .size
+    @State private var sortField: LedgerSort = .size
     @State private var sortAscending = false
-    @State private var scope: LedgerScope = .thisMac
 
-    public init(initialSelection: String? = nil) {
+    @State private var projection: LedgerModel
+
+    public init(initialSelection: String? = nil, projection: LedgerModel? = nil) {
+        _projection = State(initialValue: projection ?? LedgerModel())
         if let initialSelection {
             _hoveredID = State(initialValue: initialSelection)
         }
     }
 
-    struct LedgerRow: Identifiable {
-        let id: String
-        let name: String
-        let path: String
-        let bytes: Int64
-        let tier: Tier
-        let owner: String
-        let lastTouched: Date?
-        let item: AtlasItem?
-        let insight: SystemInsight?
-    }
-
-    enum LedgerScope { case thisMac, drive }
-
-    /// Items is an inventory with two locations once a drive is adopted:
-    /// this Mac, and the drive. Offloaded folders are first-class rows in
-    /// the drive scope, never interleaved with local sizes.
-    private var scopeBar: some View {
-        HStack(spacing: BSpace.m) {
-            Picker("", selection: $scope) {
-                Text(Copy.reconcileLocalSide).tag(LedgerScope.thisMac)
-                Text(model.stash?.volumeName ?? "").tag(LedgerScope.drive)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 340)
-            Spacer()
-            if scope == .thisMac, let stash = model.stash, stash.stashedBytes > 0 {
-                Button(Copy.ledgerOffloaded(
-                    stash.manifest.entries.filter { $0.status == .done || $0.status == .doneDirty || $0.status == .committed }.count,
-                    ByteFormat.string(stash.stashedBytes), stash.volumeName
-                )) {
-                    scope = .drive
-                }
-                .buttonStyle(.plain)
-                .font(BFont.meta)
-                .foregroundStyle(BColor.brand)
-            }
-        }
-        .padding(.horizontal, BSpace.l)
-        .padding(.top, BSpace.s)
-    }
-
-    private func driveList(_ stash: StashManager) -> some View {
-        let entries = stash.manifest.entries.filter {
-            $0.status == .done || $0.status == .doneDirty || $0.status == .committed
-        }
-        let runtimeDir = stash.stashRoot.appendingPathComponent("Runtimes", isDirectory: true).path
-        let images = ((try? FileManager.default.contentsOfDirectory(atPath: runtimeDir)) ?? [])
-            .filter { $0.hasSuffix(".dmg") }
-            .sorted()
-        return ScrollView {
-            VStack(spacing: BSpace.s) {
-                if entries.isEmpty && images.isEmpty {
-                    EmptyStateView(Copy.kibiStashEmpty, symbol: "externaldrive")
-                        .frame(height: 300)
-                }
-                ForEach(entries) { entry in
-                    driveRow(entry, stash: stash)
-                }
-                ForEach(images, id: \.self) { name in
-                    runtimeImageRow(name: name, dir: runtimeDir)
-                }
-            }
-            .padding(BSpace.l)
-        }
-    }
-
-    private func driveRow(_ entry: StashEntry, stash: StashManager) -> some View {
-        HStack(spacing: BSpace.l) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(entry.displayName)
-                    .font(BFont.body.weight(.medium))
-                    .foregroundStyle(BColor.ink)
-                HStack(spacing: 8) {
-                    Text(ByteFormat.string(entry.bytes))
-                        .font(BFont.rounded(12, .medium))
-                        .foregroundStyle(BColor.inkSoft)
-                    Text(Copy.stashMovedAgo(RelativeDate.short(entry.movedAt)))
-                        .font(BFont.meta)
-                        .foregroundStyle(BColor.inkSoft)
-                    Text(entry.sourcePath)
-                        .font(BFont.meta)
-                        .foregroundStyle(BColor.inkSoft.opacity(0.8))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
-            Spacer()
-            StashToggle(
-                isStashed: true,
-                progress: stash.progress[entry.id],
-                disabledReason: stash.volumeIsPresent ? nil : Copy.stashConnectFirst(stash.volumeName)
-            ) {
-                model.bringHome(entryID: entry.id)
-            }
-        }
-        .padding(BSpace.m)
-        .background(BColor.surface)
-        .clipShape(RoundedRectangle(cornerRadius: BRadius.control))
-        .overlay(RoundedRectangle(cornerRadius: BRadius.control).strokeBorder(BColor.line, lineWidth: 1))
-    }
-
-    private func runtimeImageRow(name: String, dir: String) -> some View {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: dir + "/" + name)
-        return HStack(spacing: BSpace.l) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text((name as NSString).deletingPathExtension)
-                    .font(BFont.body.weight(.medium))
-                    .foregroundStyle(BColor.ink)
-                HStack(spacing: 8) {
-                    Text(ByteFormat.string((attrs?[.size] as? Int64) ?? 0))
-                        .font(BFont.rounded(12, .medium))
-                        .foregroundStyle(BColor.inkSoft)
-                    Text(Copy.runtimeAddBack(model.stash?.volumeName ?? "?"))
-                        .font(BFont.meta)
-                        .foregroundStyle(BColor.inkSoft)
-                }
-            }
-            Spacer()
-            Button(Copy.addBack) { model.sheet = .cleanup(entryID: "xcode.simRuntimes") }
-                .buttonStyle(SecondarySmallButtonStyle())
-                .accessibilityLabel(Copy.addBack)
-        }
-        .padding(BSpace.m)
-        .background(BColor.surface)
-        .clipShape(RoundedRectangle(cornerRadius: BRadius.control))
-        .overlay(RoundedRectangle(cornerRadius: BRadius.control).strokeBorder(BColor.line, lineWidth: 1))
-    }
-
-    private var rows: [LedgerRow] {
-        // Items is this disk: offloaded folders live in the summary line and
-        // the Offload catalog, not interleaved with local sizes.
-        var out: [LedgerRow] = model.items.filter { !$0.isStashed }.map { item in
-            LedgerRow(
-                id: item.id, name: item.displayName, path: item.url.path,
-                bytes: item.bytes, tier: item.entry.tier,
-                owner: item.projectName ?? item.entry.owner,
-                lastTouched: item.lastTouched, item: item, insight: nil
-            )
-        }
-        for insight in model.result?.insights ?? [] {
-            let entry = Atlas.entry(insight.entryID)
-            out.append(LedgerRow(
-                id: insight.id, name: entry.title, path: "",
-                bytes: insight.bytes, tier: entry.tier, owner: entry.owner,
-                lastTouched: nil, item: nil, insight: insight
-            ))
-        }
-        if let tier = model.ledgerTierFilter {
-            out = out.filter { $0.tier == tier }
-        }
-        if !model.searchText.isEmpty {
-            out = out.filter {
-                $0.name.localizedCaseInsensitiveContains(model.searchText)
-                    || $0.owner.localizedCaseInsensitiveContains(model.searchText)
-                    || $0.path.localizedCaseInsensitiveContains(model.searchText)
-            }
-        }
-        return sorted(out)
-    }
-
-    enum SortField { case name, size, tier, touched }
-
-    private func sorted(_ rows: [LedgerRow]) -> [LedgerRow] {
-        let base: [LedgerRow]
-        switch sortField {
-        case .size:
-            base = rows.sorted { $0.bytes > $1.bytes }
-        case .name:
-            base = rows.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        case .tier:
-            base = rows.sorted { $0.tier == $1.tier ? $0.bytes > $1.bytes : $0.tier < $1.tier }
-        case .touched:
-            base = rows.sorted { $0.sortableDate > $1.sortableDate }
-        }
-        return sortAscending ? base.reversed() : base
+    private var rows: [LedgerRow] { projection.rows }
+    private var query: LedgerQuery {
+        LedgerQuery(revision: model.inventory.revision, tier: model.ledgerTierFilter,
+                    search: model.searchText, sort: sortField, ascending: sortAscending)
     }
 
     @State private var previewRowID: LedgerRow.ID?
@@ -200,22 +29,20 @@ public struct LedgerView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            if model.stash != nil { scopeBar }
-            if scope == .drive, let stash = model.stash {
-                driveList(stash)
+            // Hover and selection reuse the projection; only inventory/query
+            // changes schedule work.
+            let current = rows
+            batchBar(current)
+            if current.isEmpty {
+                EmptyStateView(emptyLine, symbol: emptySymbol)
             } else {
-                // One evaluation per render: rows maps, filters, and sorts
-                // the whole inventory, so the render path shares it.
-                let current = rows
-                batchBar(current)
-                if current.isEmpty {
-                    EmptyStateView(emptyLine, symbol: emptySymbol)
-                } else {
-                    table(current)
-                }
+                table(current)
             }
         }
         .background(BColor.bg)
+        .task(id: query) {
+            await projection.update(items: model.items, insights: model.result?.insights ?? [], query: query)
+        }
         // Space gives a Quick-Look-style preview card on the hovered row.
         .onKeyPress(.space) {
             guard let id = hoveredID ?? rows.first?.id, previewRowID == nil else {
@@ -256,15 +83,28 @@ public struct LedgerView: View {
                         .foregroundStyle(BColor.inkSoft)
                 }
             }
-            if let item = row.item {
-                Text(item.entry.identityLine)
+            if let item = row.item, item.entryID != "app.bundle" {
+                Text(row.isMerged ? row.mergedSummary : item.entry.identityLine)
                     .font(BFont.body)
                     .foregroundStyle(BColor.inkSoft)
             }
-            Text(row.path)
-                .font(BFont.path)
-                .foregroundStyle(BColor.inkSoft)
-                .fixedSize(horizontal: false, vertical: true)
+            if row.isMerged {
+                Text(Copy.locationCount(row.items.count)).font(BFont.meta).foregroundStyle(BColor.inkSoft)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(row.items) { item in
+                            HStack(alignment: .top) {
+                                Text(displayPath(item.id)).font(BFont.path).textSelection(.enabled)
+                                Spacer()
+                                Text(ByteFormat.string(item.bytes)).font(BFont.meta)
+                            }
+                        }
+                    }
+                }.frame(maxHeight: 220)
+            } else {
+                Text(row.path).font(BFont.path).foregroundStyle(BColor.inkSoft)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(BSpace.sheetPadding)
         .frame(width: 440)
@@ -290,22 +130,6 @@ public struct LedgerView: View {
                         .buttonStyle(SecondarySmallButtonStyle())
                 }
             }
-            Button(Copy.selectAllRegenerable) {
-                for row in rows where row.tier == .regenerable && row.item != nil && model.canSelect(row.item!) {
-                    if !model.trayItems.contains(row.item!) { model.toggleTray(row.item!) }
-                }
-            }
-            .buttonStyle(SecondarySmallButtonStyle())
-            Button(Copy.selectStale) {
-                let cutoff = Date().addingTimeInterval(-90 * 86_400)
-                for row in rows {
-                    guard let item = row.item, model.canSelect(item),
-                          let touched = row.lastTouched, touched < cutoff,
-                          !model.trayItems.contains(item) else { continue }
-                    model.toggleTray(item)
-                }
-            }
-            .buttonStyle(SecondarySmallButtonStyle())
             Spacer()
             Text(sortField == .size && !sortAscending
                  ? "\(Copy.itemCount(rows.count)) · \(Copy.sortedBySize)"
@@ -367,9 +191,7 @@ public struct LedgerView: View {
             columnHeader
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(rows) { row in
-                        itemRow(row)
-                    }
+                    ForEach(rows) { row in itemRow(row) }
                 }
             }
         }
@@ -395,7 +217,7 @@ public struct LedgerView: View {
 
     /// Sortable header: click to sort, click again to flip. The active
     /// column wears a real chevron, not a text glyph.
-    private func headerCell(_ label: String, field: SortField, alignment: Alignment) -> some View {
+    private func headerCell(_ label: String, field: LedgerSort, alignment: Alignment) -> some View {
         Button {
             if sortField == field {
                 sortAscending.toggle()
@@ -424,13 +246,14 @@ public struct LedgerView: View {
 
     private func itemRow(_ row: LedgerRow) -> some View {
         let finding = lensFinding(row)
-        let selectable = row.item.map { model.canSelect($0) } ?? false
-        let checked = selectable && row.item.map { model.trayItems.contains($0) } == true
+        let selectable = !row.items.isEmpty && row.items.allSatisfy { model.canSelect($0) }
+        let selectedCount = row.selectedCount(in: Set(model.trayItems.map(\.id)))
+        let checked = selectable && selectedCount == row.items.count
         return HStack(spacing: 0) {
             // Checkbox zone (52): the mock's 18 pt rounded accent box.
             HStack {
                 if selectable {
-                    planCheckbox(checked: checked)
+                    planCheckbox(checked: checked, partial: selectedCount > 0 && !checked)
                 }
             }
             .frame(width: 52, alignment: .leading)
@@ -482,13 +305,19 @@ public struct LedgerView: View {
 
             // Managed verbs stay visible (the mock shows them); the
             // selectable icon pair rests hidden and reveals on hover, so
-            // rows match the design at rest.
-            rowAction(row)
-                .opacity(selectable && hoveredID != row.id ? 0 : 1)
-                .frame(width: 100, alignment: .trailing)
+            // rows match the design at rest. Color.clear keeps the column's
+            // width even when a row has no verb at all (System bedrock),
+            // so Size and Tier never drift.
+            ZStack(alignment: .trailing) {
+                Color.clear
+                rowAction(row)
+                    .opacity(selectable && !row.isMerged && hoveredID != row.id ? 0 : 1)
+            }
+            .frame(width: 100, alignment: .trailing)
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 9)
+        .frame(height: 52)
         .background(checked ? BColor.brandSoft : (hoveredID == row.id ? BColor.surface : .clear))
         .overlay(alignment: .bottom) { Divider().overlay(BColor.hair) }
         .contentShape(Rectangle())
@@ -506,14 +335,14 @@ public struct LedgerView: View {
         .accessibilityLabel(accessibilityLine(row))
     }
 
-    private func planCheckbox(checked: Bool) -> some View {
+    private func planCheckbox(checked: Bool, partial: Bool = false) -> some View {
         RoundedRectangle(cornerRadius: 5, style: .continuous)
             .fill(checked ? AnyShapeStyle(BColor.brand) : AnyShapeStyle(BColor.surface))
             .overlay {
-                if checked {
-                    Image(systemName: "checkmark")
+                if checked || partial {
+                    Image(systemName: partial ? "minus" : "checkmark")
                         .font(.system(size: 10, weight: .heavy))
-                        .foregroundStyle(BColor.onBrand)
+                        .foregroundStyle(checked ? BColor.onBrand : BColor.brand)
                 } else {
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
                         .strokeBorder(BColor.line, lineWidth: 1.5)
@@ -525,6 +354,7 @@ public struct LedgerView: View {
     /// The single quiet sub line: what a lens saw plus the short path, or
     /// just the place itself.
     private func subLine(_ row: LedgerRow, finding: LensFinding?) -> String {
+        if row.isMerged { return "\(Copy.locationCount(row.members.count)) · \(row.mergedSummary)" }
         let short = row.path.isEmpty ? nil : displayPath(row.path)
         if let finding {
             return [finding.evidenceLine, short].compactMap { $0 }.joined(separator: " · ")
@@ -534,6 +364,13 @@ public struct LedgerView: View {
             String(line.split(separator: ".").first.map(String.init) ?? line)
         }
         if let item = row.item {
+            // App rows carry no descriptor: the name and icon already say
+            // what it is, and no bundle ships a usable description of its
+            // own (probed: kMDItemDescription and CFBundleGetInfoString are
+            // empty across common apps). The path still says where.
+            if item.entryID == "app.bundle" {
+                return short ?? ""
+            }
             return [firstClause(item.entry.identityLine), short].compactMap { $0 }.joined(separator: " · ")
         }
         if let insight = row.insight {
@@ -547,7 +384,15 @@ public struct LedgerView: View {
     /// moves itself, worded pills where another tool or a lesson does the work.
     @ViewBuilder
     private func rowAction(_ row: LedgerRow) -> some View {
-        if let item = row.item, model.canSelect(item) {
+        if row.isMerged {
+            if row.items.allSatisfy({ model.canSelect($0) }) {
+                Button(Copy.reviewCleanup) { model.openReclaimPlan(items: row.items) }
+                    .buttonStyle(RowActionButtonStyle())
+            } else {
+                Button(Copy.groupDetails) { previewRowID = row.id }
+                    .buttonStyle(RowActionButtonStyle())
+            }
+        } else if let item = row.item, model.canSelect(item) {
             HStack(spacing: 6) {
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([item.url])
@@ -558,36 +403,18 @@ public struct LedgerView: View {
                 .help(Copy.revealInFinder)
                 .accessibilityLabel(Copy.revealInFinder)
                 Button {
-                    model.openReclaimPlan(items: [item])
+                    model.perform(.reclaim, on: item)
                 } label: {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(RowIconButtonStyle())
                 .help(Copy.trayReclaim)
                 .accessibilityLabel(Copy.trayReclaim)
-                if let stash = model.stash, item.entry.stashable, !item.isStashed {
-                    Button {
-                        model.stashItem(item)
-                    } label: {
-                        Image(systemName: "externaldrive")
-                    }
-                    .buttonStyle(RowIconButtonStyle())
-                    .disabled(!stash.volumeIsPresent)
-                    .help(stash.volumeIsPresent ? Copy.trayStash : Copy.stashConnectFirst(stash.volumeName))
-                    .accessibilityLabel(Copy.trayStash)
-                }
             }
-        } else if let item = row.item,
-                  let tool = ToolCleanup.tool(for: item.entryID),
-                  model.toolsAvailable.contains(tool) {
-            Button(Copy.cleanUp) { model.sheet = .cleanup(entryID: item.entryID) }
+        } else if let item = row.item, let action = model.action(for: item) {
+            Button(action.title) { model.perform(action, on: item) }
                 .buttonStyle(RowActionButtonStyle())
-        } else if let item = row.item, ToolCleanup.directReclaimEntryIDs.contains(item.entryID) {
-            Button(Copy.trayReclaim) { model.openReclaimPlan(items: [item]) }
-                .buttonStyle(RowActionButtonStyle())
-        } else if let item = row.item, let flow = item.entry.teachFlow {
-            Button(Copy.showMe) { model.sheet = .teach(flow, bytes: item.bytes) }
-                .buttonStyle(RowActionButtonStyle())
+                .accessibilityLabel(action.title)
         } else if let insight = row.insight, let flow = Atlas.entry(insight.entryID).teachFlow {
             Button(Copy.showMe) { model.sheet = .teach(flow, bytes: insight.bytes) }
                 .buttonStyle(RowActionButtonStyle())
@@ -599,15 +426,16 @@ public struct LedgerView: View {
     /// everything between, ticking down the range in a brief cascade.
     private func trayBinding(_ row: LedgerRow) -> Binding<Bool> {
         Binding(
-            get: { row.item.map { model.trayItems.contains($0) } ?? false },
+            get: { !row.items.isEmpty && row.items.allSatisfy { model.trayItems.contains($0) } },
             set: { include in
                 let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
+                let visible = rows
                 if shift, let anchor = checkAnchorID, anchor != row.id,
-                   let a = rows.firstIndex(where: { $0.id == anchor }),
-                   let b = rows.firstIndex(where: { $0.id == row.id }) {
-                    applyTray(Array(rows[min(a, b)...max(a, b)]), include: include)
-                } else if let item = row.item, model.trayItems.contains(item) != include {
-                    model.toggleTray(item)
+                   let a = visible.firstIndex(where: { $0.id == anchor }),
+                   let b = visible.firstIndex(where: { $0.id == row.id }) {
+                    applyTray(Array(visible[min(a, b)...max(a, b)]), include: include)
+                } else {
+                    model.setTray(items: row.items, selected: include)
                 }
                 checkAnchorID = row.id
             }
@@ -618,9 +446,7 @@ public struct LedgerView: View {
         let step: UInt64 = reduceMotion ? 0 : min(25_000_000, 400_000_000 / UInt64(max(range.count, 1)))
         Task {
             for row in range {
-                guard let item = row.item, model.canSelect(item),
-                      model.trayItems.contains(item) != include else { continue }
-                model.toggleTray(item)
+                model.setTray(items: row.items, selected: include)
                 if step > 0 { try? await Task.sleep(nanoseconds: step) }
             }
         }
@@ -641,13 +467,14 @@ public struct LedgerView: View {
     private func accessibilityLine(_ row: LedgerRow) -> String {
         // VoiceOver order: name, size, tier, last touched.
         var parts = [row.name, ByteFormat.string(row.bytes), row.tier.label]
+        if row.isMerged { parts.append(Copy.locationCount(row.items.count)) }
         if let touched = row.lastTouched { parts.append(RelativeDate.short(touched)) }
         return parts.joined(separator: ", ")
     }
 
     @ViewBuilder
     private func contextMenu(ids: Set<LedgerRow.ID>) -> some View {
-        let selected = rows.filter { ids.contains($0.id) }.compactMap(\.item)
+        let selected = rows.filter { ids.contains($0.id) }.flatMap(\.items)
         if !selected.isEmpty {
             if selected.allSatisfy({ model.canSelect($0) }) {
                 Button(Copy.trayReclaim) {
@@ -655,11 +482,6 @@ public struct LedgerView: View {
                         model.toggleTray(item)
                     }
                     model.openReclaimPlan()
-                }
-            }
-            if selected.allSatisfy({ $0.entry.stashable && !$0.isStashed }) {
-                Button(Copy.trayStash) {
-                    for item in selected { model.stashItem(item) }
                 }
             }
             if let first = selected.first, selected.count == 1 {
@@ -670,12 +492,8 @@ public struct LedgerView: View {
         }
         // The trailing action column's verb, mirrored for one row.
         if ids.count == 1, let row = rows.first(where: { ids.contains($0.id) }) {
-            if let item = row.item, let tool = ToolCleanup.tool(for: item.entryID),
-               model.toolsAvailable.contains(tool) {
-                Button(Copy.cleanUp) { model.sheet = .cleanup(entryID: item.entryID) }
-            } else if let item = row.item, let flow = item.entry.teachFlow,
-                      !model.canSelect(item) {
-                Button(Copy.showMe) { model.sheet = .teach(flow, bytes: item.bytes) }
+            if let item = row.item, !model.canSelect(item), let action = model.action(for: item) {
+                Button(action.title) { model.perform(action, on: item) }
             } else if let insight = row.insight,
                       let flow = Atlas.entry(insight.entryID).teachFlow {
                 Button(Copy.showMe) { model.sheet = .teach(flow, bytes: insight.bytes) }
@@ -684,9 +502,6 @@ public struct LedgerView: View {
     }
 }
 
-extension LedgerView.LedgerRow {
-    var sortableDate: Date { lastTouched ?? .distantPast }
-}
 
 /// Every row carries a face at thumbnail scale. App-owned items wear
 /// their app's real icon, genuine files and bundles wear their Finder icon,
@@ -729,8 +544,12 @@ struct ItemIcon: View {
         .task(id: cacheKey) {
             let key = cacheKey as NSString
             if let hit = Self.cache.object(forKey: key) { image = hit; return }
-            let resolve = resolvedImage
-            let found = await Task.detached(priority: .utility) { resolve() }.value
+            image = nil
+            let entryID = entryID, url = url, owner = owner, lensKind = lensKind
+            let found = await Task.detached(priority: .utility) {
+                Self.resolve(entryID: entryID, url: url, owner: owner, lensKind: lensKind)
+            }.value
+            guard !Task.isCancelled else { return }
             if let found {
                 Self.cache.setObject(found, forKey: key)
                 image = found
@@ -740,12 +559,7 @@ struct ItemIcon: View {
 
     private var cacheKey: String { entryID + "|" + (url?.path ?? owner) }
 
-    private var resolvedImage: @Sendable () -> NSImage? {
-        let entryID = entryID, url = url, owner = owner, lensKind = lensKind
-        return { Self.resolve(entryID: entryID, url: url, owner: owner, lensKind: lensKind) }
-    }
-
-    private static func resolve(entryID: String, url: URL?, owner: String, lensKind: LensKind?) -> NSImage? {
+    nonisolated private static func resolve(entryID: String, url: URL?, owner: String, lensKind: LensKind?) -> NSImage? {
         let fm = FileManager.default
         func app(_ name: String) -> NSImage? {
             let path = "/Applications/\(name).app"
@@ -759,7 +573,6 @@ struct ItemIcon: View {
         if entryID.hasPrefix("xcode."), let icon = app("Xcode") { return icon }
         if lensKind == .game, let icon = app("Steam") { return icon }
         switch owner {
-        case "Docker", "OrbStack", "Ollama": if let icon = app(owner) { return icon }
         case "Simulator": if let icon = app("Xcode") { return icon }
         default: break
         }
@@ -797,6 +610,9 @@ struct ItemIcon: View {
         case "sys.trash": return "trash"
         case "sys.purgeable": return "internaldrive"
         case "sys.snapshots": return "clock.arrow.circlepath"
+        case "sys.os": return "apple.logo"
+        case "sys.updateStaging": return "arrow.down.circle"
+        case "sys.swap": return "memorychip"
         case "xcode.simDevices", "xcode.testDevices", "xcode.simRuntimes": return "iphone"
         default: break
         }
@@ -808,6 +624,7 @@ struct ItemIcon: View {
         case .containers: return "shippingbox"
         case .ml: return "brain"
         case .systemResidue: return "internaldrive"
+        case .applications: return "square.grid.2x2"
         }
     }
 }
@@ -827,7 +644,7 @@ struct RowActionButtonStyle: ButtonStyle {
     }
 }
 
-/// The icon variant for the mechanical pair (Reclaim, Offload): same quiet
+/// The icon variant for the mechanical action (Reclaim): same quiet
 /// bordered language, round, tooltip carries the word.
 struct RowIconButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled

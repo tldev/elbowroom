@@ -37,7 +37,6 @@ public enum BColor {
     public static let faint = dynamicColor(light: "#B8B2AA", dark: "#6B655D")
     /// The one action color: terracotta.
     public static let brand = dynamicColor(light: "#A75F34", dark: "#DE8F57")
-    public static let brandHover = dynamicColor(light: "#975124", dark: "#EF9F67")
     /// Label on an accent-filled control.
     public static let onBrand = dynamicColor(light: "#FFFFFF", dark: "#221D16")
     /// Selected-row wash and quiet accent fills.
@@ -47,7 +46,9 @@ public enum BColor {
     public static let tierRegen = dynamicColor(light: "#389560", dark: "#53AE77")     // Cache
     public static let tierRebuild = dynamicColor(light: "#C87F2C", dark: "#DC9242")   // Derived
     public static let tierManaged = dynamicColor(light: "#5182C1", dark: "#689BDB")   // App-managed
+    public static let tierApps = dynamicColor(light: "#8465B5", dark: "#9E82D0")      // Apps: muted violet
     public static let tierYours = dynamicColor(light: "#90847A", dark: "#9C9086")     // Personal: warm neutral
+    public static let tierSystem = dynamicColor(light: "#6E7B8A", dark: "#8595A6")    // System: cool steel
     /// Good news (shrinkage, headroom returned).
     public static let ok = dynamicColor(light: "#1C7F4C", dark: "#59B47D")
 
@@ -67,10 +68,8 @@ public enum BSpace {
     public static let xl: CGFloat = 24
     public static let xxl: CGFloat = 32
     public static let huge: CGFloat = 48
-    public static let hero: CGFloat = 64
     public static let cardPadding: CGFloat = 16
     public static let sheetPadding: CGFloat = 24
-    public static let sectionGap: CGFloat = 32
 }
 
 public enum BRadius {
@@ -78,15 +77,11 @@ public enum BRadius {
     public static let sheet: CGFloat = 14
     public static let control: CGFloat = 9
     public static let chamber: CGFloat = 8
-    /// Full pill, for small actions and filter chips.
-    public static let pill: CGFloat = 999
 }
 
 // Type: SF Pro straight, tabular figures everywhere digits align; SF Mono
 // for paths and commands. No display whimsy; hierarchy from size and weight.
 public enum BFont {
-    public static let hero = Font.system(size: 64, weight: .semibold).monospacedDigit()
-    public static let denHero = Font.system(size: 52, weight: .heavy).monospacedDigit()
     public static let title = Font.system(size: 22, weight: .semibold)
     public static let subtitle = Font.system(size: 15, weight: .medium)
     public static let body = Font.system(size: 13)
@@ -100,7 +95,6 @@ public enum BFont {
 // Springs: unchanged mechanics, restrained by usage.
 public enum BMotion {
     public static let standard = Animation.spring(response: 0.35, dampingFraction: 0.85)
-    public static let heavy = Animation.spring(response: 0.5, dampingFraction: 0.8)
     public static let light = Animation.spring(response: 0.25, dampingFraction: 0.9)
 }
 

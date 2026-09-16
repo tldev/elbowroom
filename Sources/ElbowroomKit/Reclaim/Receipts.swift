@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 /// The permanent, append-only receipt of everything Elbowroom ever removed.
 
@@ -55,19 +56,19 @@ public struct Receipt: Codable, Identifiable, Sendable {
 }
 
 /// Receipts persist under Application Support so they survive reinstall.
-public final class ReceiptStore: @unchecked Sendable {
+@MainActor
+@Observable
+public final class ReceiptStore {
     public private(set) var receipts: [Receipt] = []
     private let fileURL: URL
-    private let queue = DispatchQueue(label: "elbowroom.receipts")
+    @ObservationIgnored private let queue = DispatchQueue(label: "elbowroom.receipts")
 
     public init(directory: URL? = nil) {
         let dir = directory ?? Self.defaultDirectory()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         fileURL = dir.appendingPathComponent("receipts.json")
-        load()
     }
 
-    public static func defaultDirectory() -> URL {
+    nonisolated public static func defaultDirectory() -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Elbowroom", isDirectory: true)
     }
@@ -75,52 +76,88 @@ public final class ReceiptStore: @unchecked Sendable {
     public var lifetimeBytes: Int64 { receipts.reduce(0) { $0 + $1.totalBytes } }
 
     public func append(_ receipt: Receipt) {
-        queue.sync {
-            receipts.append(receipt)
+        receipts.append(receipt)
+        save()
+    }
+
+    public func update(_ receipt: Receipt) {
+        if let index = receipts.firstIndex(where: { $0.id == receipt.id }) {
+            receipts[index] = receipt
             save()
         }
     }
 
-    public func update(_ receipt: Receipt) {
-        queue.sync {
-            if let i = receipts.firstIndex(where: { $0.id == receipt.id }) {
-                receipts[i] = receipt
-                save()
-            }
-        }
-    }
+    @ObservationIgnored private var loaded = false
+    @ObservationIgnored private var loadTask: Task<[Receipt], Never>?
 
-    /// The 7-day auto-empty: remove Elbowroom trash folders whose window ran
-    /// out, and reconcile receipts whose folder the user already emptied.
-    public func sweepExpired(now: Date = Date()) {
-        queue.sync {
-            var changed = false
-            for i in receipts.indices where receipts[i].restoreStatus == .inTrash {
-                if let folder = receipts[i].trashFolder {
-                    let exists = FileManager.default.fileExists(atPath: folder)
-                    if !exists {
-                        receipts[i].restoreStatus = .emptied
-                        changed = true
-                    } else if now.timeIntervalSince(receipts[i].date) > 7 * 86_400 {
-                        try? FileManager.default.removeItem(atPath: folder)
-                        receipts[i].restoreStatus = .emptied
-                        changed = true
-                    }
-                } else if now.timeIntervalSince(receipts[i].date) > 7 * 86_400 {
-                    // Brokered trash: remove the recorded items where allowed;
-                    // the receipt flips only when none remain on disk.
-                    let paths = receipts[i].items.compactMap(\.trashedTo)
-                    for path in paths {
-                        try? FileManager.default.removeItem(atPath: path)
-                    }
-                    let remaining = paths.filter { FileManager.default.fileExists(atPath: $0) }
-                    if remaining.isEmpty {
-                        receipts[i].restoreStatus = .emptied
-                        changed = true
+    public func loadFromDisk() async {
+        guard !loaded else { return }
+        if loadTask == nil {
+            let file = fileURL, queue = queue
+            loadTask = Task {
+                await withCheckedContinuation { continuation in
+                    queue.async {
+                        let values = (try? JSONDecoder().decode([Receipt].self, from: Data(contentsOf: file))) ?? []
+                        continuation.resume(returning: values)
                     }
                 }
             }
-            if changed { save() }
+        }
+        let stored = await loadTask!.value
+        guard !loaded else { return }
+        let pending = Set(receipts.map(\.id))
+        receipts = stored.filter { !pending.contains($0.id) } + receipts
+        loaded = true
+        loadTask = nil
+        save()
+    }
+
+    /// Deletion and restore share the persistence queue so they cannot race.
+    public func sweepExpired(now: Date = Date()) async {
+        await loadFromDisk()
+        let snapshot = receipts
+        let expired: Set<UUID> = await withCheckedContinuation { continuation in
+            queue.async {
+                let fm = FileManager.default
+                var expired: Set<UUID> = []
+                for receipt in snapshot where receipt.restoreStatus == .inTrash {
+                    let paths = receipt.trashFolder.map { [$0] } ?? receipt.items.compactMap(\.trashedTo)
+                    if now.timeIntervalSince(receipt.date) > 7 * 86_400 {
+                        for path in paths { try? fm.removeItem(atPath: path) }
+                    }
+                    if !paths.isEmpty && paths.allSatisfy({ !fm.fileExists(atPath: $0) }) {
+                        expired.insert(receipt.id)
+                    }
+                }
+                continuation.resume(returning: expired)
+            }
+        }
+        for index in receipts.indices where receipts[index].restoreStatus == .inTrash && expired.contains(receipts[index].id) {
+            receipts[index].restoreStatus = .emptied
+        }
+        if !expired.isEmpty { save() }
+    }
+
+    public func restore(_ receipt: Receipt) async -> Bool {
+        await loadFromDisk()
+        let restored: Bool = await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume(returning: ReclaimExecutor().restore(receipt: receipt))
+            }
+        }
+        if restored {
+            var updated = receipt
+            updated.restoreStatus = .restored
+            update(updated)
+        }
+        return restored
+    }
+
+    /// Await writes for tests and explicit persistence checkpoints.
+    public func flush() async {
+        await loadFromDisk()
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
         }
     }
 
@@ -129,20 +166,26 @@ public final class ReceiptStore: @unchecked Sendable {
         let df = ISO8601DateFormatter()
         for r in receipts {
             for item in r.items {
-                let name = item.name.replacingOccurrences(of: ",", with: " ")
-                lines.append("\(df.string(from: r.date)),\(name),\(item.path),\(item.bytes),\(item.tier.rawValue)")
+                lines.append([df.string(from: r.date), item.name, item.path,
+                              String(item.bytes), item.tier.rawValue]
+                    .map(Self.csvField).joined(separator: ","))
             }
         }
         return lines.joined(separator: "\n")
     }
 
-    private func load() {
-        guard let data = try? Data(contentsOf: fileURL) else { return }
-        receipts = (try? JSONDecoder().decode([Receipt].self, from: data)) ?? []
+    private static func csvField(_ value: String) -> String {
+        guard value.contains(where: { ",\"\r\n".contains($0) }) else { return value }
+        return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
     private func save() {
-        guard let data = try? JSONEncoder().encode(receipts) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        guard loaded else { return }
+        let snapshot = receipts, file = fileURL
+        queue.async {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: file, options: .atomic)
+        }
     }
 }

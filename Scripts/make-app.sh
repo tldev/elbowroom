@@ -1,17 +1,15 @@
 #!/bin/bash
 # Build Elbowroom.app from the SwiftPM package.
-# Usage: Scripts/make-app.sh [debug|release] [--sandbox]
-#   --sandbox  sign with entitlements (App Sandbox + user-selected files +
-#              security-scoped bookmarks) using the best identity available.
+# Usage: Scripts/make-app.sh [debug|release]
+# Direct-download distribution only; no App Sandbox build.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG="release"
-SANDBOX=0
 for arg in "$@"; do
   case "$arg" in
     debug|release) CONFIG="$arg" ;;
-    --sandbox) SANDBOX=1 ;;
+    *) echo "usage: $0 [debug|release] (direct distribution only)" >&2; exit 2 ;;
   esac
 done
 
@@ -23,6 +21,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN/Elbowroom" "$APP/Contents/MacOS/Elbowroom"
+cp "$BIN/ElbowroomAppMover" "$APP/Contents/MacOS/ElbowroomAppMover"
 if [ -d "$BIN/Elbowroom_ElbowroomKit.bundle" ]; then
   cp -R "$BIN/Elbowroom_ElbowroomKit.bundle" "$APP/Contents/Resources/"
 fi
@@ -50,7 +49,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleLocalizations</key><array><string>en</string><string>ja</string></array>
 	<key>CFBundleExecutable</key><string>Elbowroom</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
-	<key>CFBundleIdentifier</key><string>io.elbowroom.app</string>
+	<key>CFBundleIdentifier</key><string>dev.elbowroom.app</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>Elbowroom</string>
 	<key>CFBundleDisplayName</key><string>Elbowroom</string>
@@ -65,36 +64,20 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-if [ "$SANDBOX" = "1" ]; then
-  # Sign by certificate hash: names can be ambiguous when a keychain holds
-  # several certs with the same subject. Prefer Developer ID, else Apple
-  # Development.
-  IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | grep -v REVOKED | head -1 | awk '{print $2}')
-  if [ -z "$IDENTITY" ]; then
-    IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | grep -v REVOKED | head -1 | awk '{print $2}')
-  fi
-  if [ -z "$IDENTITY" ]; then
-    echo "no signing identity found; cannot sandbox" >&2
-    exit 1
-  fi
-  echo "signing sandboxed with identity $IDENTITY"
-  codesign --force --options runtime \
-    --entitlements Resources/Elbowroom.entitlements \
-    --sign "$IDENTITY" "$APP"
+# Stable identity even for the dev build: TCC grants (Full Disk Access,
+# folder consents) key on the signing identity, so ad-hoc signing resets
+# every grant on every rebuild. Fall back to ad-hoc when no cert exists.
+IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | grep -v REVOKED | head -1 | awk '{print $2}' || true)
+if [ -z "$IDENTITY" ]; then
+  IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | grep -v REVOKED | head -1 | awk '{print $2}' || true)
+fi
+if [ -n "$IDENTITY" ]; then
+  echo "signing with stable identity $IDENTITY"
+  codesign --force --options runtime --sign "$IDENTITY" "$APP/Contents/MacOS/ElbowroomAppMover"
+  codesign --force --sign "$IDENTITY" "$APP"
 else
-  # Stable identity even for the dev build: TCC grants (Full Disk Access,
-  # folder consents) key on the signing identity, so ad-hoc signing resets
-  # every grant on every rebuild. Fall back to ad-hoc when no cert exists.
-  IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | grep -v REVOKED | head -1 | awk '{print $2}' || true)
-  if [ -z "$IDENTITY" ]; then
-    IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | grep -v REVOKED | head -1 | awk '{print $2}' || true)
-  fi
-  if [ -n "$IDENTITY" ]; then
-    echo "signing with stable identity $IDENTITY"
-    codesign --force --sign "$IDENTITY" "$APP"
-  else
-    codesign --force --sign - "$APP" 2>/dev/null || true
-  fi
+  codesign --force --sign - "$APP/Contents/MacOS/ElbowroomAppMover"
+  codesign --force --sign - "$APP" 2>/dev/null || true
 fi
 
 codesign -dv "$APP" 2>&1 | grep -E "Signature|Authority" | head -2 || true

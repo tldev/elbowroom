@@ -9,7 +9,7 @@ public struct ElbowroomSettingsView: View {
     public init() {}
 
     private var tabs: [String] {
-        [Loc.t("General"), Loc.t("Receipts"), Copy.toggleStash, Loc.t("Privacy")]
+        [Loc.t("General"), Loc.t("Receipts"), Loc.t("Privacy")]
     }
 
     public var body: some View {
@@ -44,7 +44,6 @@ public struct ElbowroomSettingsView: View {
                 switch tab {
                 case 0: GeneralPane()
                 case 1: ReceiptsPane()
-                case 2: StashPane()
                 default: PrivacyPane()
                 }
             }
@@ -66,7 +65,7 @@ struct GeneralPane: View {
                 VStack(spacing: 0) {
                     settingsRow(Loc.t("Language")) {
                         Picker("", selection: $langOverride) {
-                            Text(Loc.t("System")).tag("")
+                            Text(Copy.themeFollowSystem).tag("")
                             Text("English").tag("en")
                             Text("日本語").tag("ja")
                         }
@@ -76,6 +75,13 @@ struct GeneralPane: View {
                     Divider().overlay(BColor.hair)
                     settingsRow(Loc.t("Play sounds")) {
                         Toggle("", isOn: $settings.soundsOn)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                    }
+                    Divider().overlay(BColor.hair)
+                    settingsRow(Copy.keepInTrashLabel) {
+                        Toggle("", isOn: $settings.keepInTrashDefault)
                             .labelsHidden()
                             .toggleStyle(.switch)
                             .controlSize(.small)
@@ -124,45 +130,20 @@ struct GeneralPane: View {
                         .padding(.horizontal, 4)
                         .padding(.top, 10)
                 }
+                Text(Copy.keepInTrashNote)
+                    .font(BFont.meta)
+                    .foregroundStyle(BColor.inkSoft)
+                    .padding(.horizontal, 4)
+                    .padding(.top, 12)
                 Text(Loc.t("The connection speed only phrases re-download times. Nothing uploads."))
                     .font(BFont.meta)
                     .foregroundStyle(BColor.inkSoft)
                     .padding(.horizontal, 4)
                     .padding(.top, 12)
-                proLine
             }
             .padding(BSpace.xl)
         }
         .background(BColor.bg)
-    }
-
-    @ViewBuilder
-    private var proLine: some View {
-        if PurchaseManager.isDevDistribution {
-            HStack(spacing: 8) {
-                if model.pro.isPro {
-                    Circle()
-                        .strokeBorder(BColor.brand, lineWidth: 1.5)
-                        .frame(width: 14, height: 14)
-                        .overlay(
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 7, weight: .heavy))
-                                .foregroundStyle(BColor.brand)
-                        )
-                    Text(Copy.devUnlockDone)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(BColor.inkSoft)
-                } else {
-                    Button(Copy.devUnlock) { model.pro.unlock() }
-                        .buttonStyle(SecondarySmallButtonStyle())
-                    Text(Copy.devUnlockNote)
-                        .font(BFont.meta)
-                        .foregroundStyle(BColor.inkSoft)
-                }
-            }
-            .padding(.horizontal, 4)
-            .padding(.top, 14)
-        }
     }
 
     private func settingsRow(_ label: String, @ViewBuilder control: () -> some View) -> some View {
@@ -236,11 +217,8 @@ struct ReceiptsPane: View {
             }
             if receipt.restoreStatus == .inTrash {
                 Button(Copy.putBack) {
-                    var updated = receipt
-                    if ReclaimExecutor().restore(receipt: receipt) {
-                        updated.restoreStatus = .restored
-                        model.receipts.update(updated)
-                        model.rescanSoon()
+                    Task {
+                        if await model.receipts.restore(receipt) { model.rescanSoon() }
                     }
                 }
                 .controlSize(.small)
@@ -271,36 +249,6 @@ struct ReceiptsPane: View {
         if panel.runModal() == .OK, let url = panel.url {
             try? model.receipts.exportCSV().write(to: url, atomically: true, encoding: .utf8)
         }
-    }
-}
-
-struct StashPane: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        @Bindable var settings = model.settings
-        Form {
-            if let stash = model.stash {
-                LabeledContent(Loc.t("Stash drive"), value: stash.volumeName)
-                LabeledContent(Loc.t("Stashed"), value: ByteFormat.string(stash.stashedBytes))
-                LabeledContent(Loc.t("Entries"), value: String(stash.manifest.entries.filter { $0.status == .done }.count))
-                Toggle(Loc.t("Verify every byte after copies"), isOn: $settings.fullHashVerify)
-                Text(Loc.t("Sampled verification is the default; full verification reads the whole copy back."))
-                    .font(BFont.meta)
-                    .foregroundStyle(BColor.inkSoft)
-                Button(Loc.t("Open the Stash catalog")) { model.sheet = .stashCatalog }
-                Button(Copy.offboarding) {
-                    model.sheet = .stashCatalog
-                }
-            } else {
-                Text(Copy.kibiStashEmpty)
-                    .font(BFont.body)
-                    .foregroundStyle(BColor.inkSoft)
-                Button(Loc.t("Set up a Stash drive")) { model.sheet = .stashSetup }
-            }
-        }
-        .formStyle(.grouped)
-        .padding()
     }
 }
 
@@ -391,7 +339,7 @@ public struct AboutView: View {
     }
 }
 
-// MARK: - Steward menu (the Guardian's second hat)
+// MARK: - Steward menu
 
 public struct StewardMenu: View {
     @Environment(AppModel.self) private var model
@@ -413,20 +361,6 @@ public struct StewardMenu: View {
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "main")
                 model.openReclaimPlan(items: model.crisisPlan())
-            }
-            if !model.guardian.conflicts.isEmpty, let first = model.guardian.conflicts.first {
-                Button(Copy.reconcileTitle(first.displayName)) {
-                    NSApp.activate(ignoringOtherApps: true)
-                    openWindow(id: "main")
-                    model.sheet = .reconcile(first)
-                }
-            }
-            if model.stash != nil {
-                Button(Copy.stewardEject) {
-                    model.guardian.safeEject { blocked in
-                        if let blocked { model.toast = Toast(text: blocked) }
-                    }
-                }
             }
             Divider()
             Button(Copy.stewardPause) {

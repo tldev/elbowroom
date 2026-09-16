@@ -35,12 +35,12 @@ struct ElbowroomApp: App {
                 .environment(model)
         }
 
-        ///: the Guardian in the menu bar, wearing its Steward hat.
+        ///: the Steward in the menu bar, watching free space.
         MenuBarExtra {
             StewardMenu()
                 .environment(model)
         } label: {
-            Image(systemName: model.guardian.state.menuSymbol)
+            Image(systemName: "internaldrive")
         }
 
         Window("About Elbowroom", id: "about") {

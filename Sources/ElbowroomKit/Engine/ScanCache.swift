@@ -8,24 +8,24 @@ extension ScanNode: Codable {
     private enum CodingKeys: String, CodingKey {
         case path, isDirectory, allocatedBytes, lastTouched, children
         case collapsedCount, collapsedBytes, atlasEntryID, projectName
-        case isDataless, isStashed
+        case isDataless
     }
 
-    public convenience init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let path = try c.decode(String.self, forKey: .path)
-        let isDir = try c.decode(Bool.self, forKey: .isDirectory)
-        self.init(url: URL(fileURLWithPath: path), isDirectory: isDir, parent: nil)
-        allocatedBytes = try c.decode(Int64.self, forKey: .allocatedBytes)
-        lastTouched = try c.decodeIfPresent(Date.self, forKey: .lastTouched)
-        collapsedCount = try c.decode(Int.self, forKey: .collapsedCount)
-        collapsedBytes = try c.decode(Int64.self, forKey: .collapsedBytes)
-        atlasEntryID = try c.decodeIfPresent(String.self, forKey: .atlasEntryID)
-        projectName = try c.decodeIfPresent(String.self, forKey: .projectName)
-        isDataless = try c.decode(Bool.self, forKey: .isDataless)
-        isStashed = try c.decode(Bool.self, forKey: .isStashed)
-        children = try c.decode([ScanNode].self, forKey: .children)
-        for child in children { child.parent = self }
+        let isDirectory = try c.decode(Bool.self, forKey: .isDirectory)
+        self.init(
+            url: URL(fileURLWithPath: try c.decode(String.self, forKey: .path), isDirectory: isDirectory),
+            isDirectory: isDirectory,
+            allocatedBytes: try c.decode(Int64.self, forKey: .allocatedBytes),
+            lastTouched: try c.decodeIfPresent(Date.self, forKey: .lastTouched),
+            children: try c.decode([ScanNode].self, forKey: .children),
+            collapsedCount: try c.decode(Int.self, forKey: .collapsedCount),
+            collapsedBytes: try c.decode(Int64.self, forKey: .collapsedBytes),
+            atlasEntryID: try c.decodeIfPresent(String.self, forKey: .atlasEntryID),
+            projectName: try c.decodeIfPresent(String.self, forKey: .projectName),
+            isDataless: try c.decode(Bool.self, forKey: .isDataless)
+        )
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -39,14 +39,13 @@ extension ScanNode: Codable {
         try c.encodeIfPresent(atlasEntryID, forKey: .atlasEntryID)
         try c.encodeIfPresent(projectName, forKey: .projectName)
         try c.encode(isDataless, forKey: .isDataless)
-        try c.encode(isStashed, forKey: .isStashed)
         try c.encode(children, forKey: .children)
     }
 }
 
 extension AtlasItem: Codable {
     private enum CodingKeys: String, CodingKey {
-        case entryID, path, bytes, lastTouched, projectName, isStashed
+        case entryID, path, bytes, lastTouched, projectName
     }
 
     public init(from decoder: Decoder) throws {
@@ -58,7 +57,6 @@ extension AtlasItem: Codable {
             lastTouched: try c.decodeIfPresent(Date.self, forKey: .lastTouched),
             projectName: try c.decodeIfPresent(String.self, forKey: .projectName)
         )
-        isStashed = try c.decode(Bool.self, forKey: .isStashed)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -68,7 +66,6 @@ extension AtlasItem: Codable {
         try c.encode(bytes, forKey: .bytes)
         try c.encodeIfPresent(lastTouched, forKey: .lastTouched)
         try c.encodeIfPresent(projectName, forKey: .projectName)
-        try c.encode(isStashed, forKey: .isStashed)
     }
 }
 
@@ -95,10 +92,10 @@ extension SystemInsight: Codable {
 extension ScanResult: Codable {
     private enum CodingKeys: String, CodingKey {
         case root, items, repoStaleness, deniedPaths, disk, duration
-        case insights, scannedBytes, classifiedBytes, finishedAt, lensFindings
+        case insights, scannedBytes, classifiedBytes, finishedAt, lensFindings, outsideWalkBytes
     }
 
-    public convenience init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.init(
             root: try c.decode(ScanNode.self, forKey: .root),
@@ -111,7 +108,8 @@ extension ScanResult: Codable {
             scannedBytes: try c.decode(Int64.self, forKey: .scannedBytes),
             classifiedBytes: try c.decode(Int64.self, forKey: .classifiedBytes),
             finishedAt: try c.decodeIfPresent(Date.self, forKey: .finishedAt),
-            lensFindings: try c.decodeIfPresent([LensFinding].self, forKey: .lensFindings) ?? []
+            lensFindings: try c.decodeIfPresent([LensFinding].self, forKey: .lensFindings) ?? [],
+            outsideWalkBytes: try c.decodeIfPresent(Int64.self, forKey: .outsideWalkBytes) ?? 0
         )
     }
 
@@ -125,6 +123,7 @@ extension ScanResult: Codable {
         try c.encode(duration, forKey: .duration)
         try c.encode(insights, forKey: .insights)
         try c.encode(scannedBytes, forKey: .scannedBytes)
+        try c.encode(outsideWalkBytes, forKey: .outsideWalkBytes)
         try c.encode(classifiedBytes, forKey: .classifiedBytes)
         try c.encode(finishedAt, forKey: .finishedAt)
         try c.encode(lensFindings, forKey: .lensFindings)
@@ -132,12 +131,21 @@ extension ScanResult: Codable {
 }
 
 public enum ScanCache {
+    private static let writes = DispatchQueue(label: "elbowroom.scan-cache", qos: .utility)
+
+    /// Enqueued in publication order; each closure owns an independent value.
+    public static func enqueueSave(_ result: ScanResult, rootPath: String, to destination: URL? = nil) {
+        writes.async { save(result, rootPath: rootPath, to: destination) }
+    }
+
     // 2: lens findings ride the result; older caches predate the
     // post-pass and would restore an inventory with no Personal rows.
     // 3: runtime mounts skipped, asset-store bytes on the runtimes item.
     // 4: one Simulator item.
     // 5: project lens; older caches would restore with no project rows.
-    static let version = 5
+    // 6: personal libraries and tool caches; uv data is no longer a cache.
+    // 7: app cache components and storage groups.
+    static let version = 10
 
     struct Envelope: Codable {
         let version: Int
@@ -150,14 +158,16 @@ public enum ScanCache {
         ReceiptStore.defaultDirectory().appendingPathComponent("scan-cache.json")
     }
 
-    public static func save(_ result: ScanResult, rootPath: String) {
+    public static func save(_ result: ScanResult, rootPath: String, to destination: URL? = nil) {
+        let fileURL = destination ?? Self.fileURL
         let envelope = Envelope(version: version, rootPath: rootPath, savedAt: Date(), result: result)
         guard let data = try? JSONEncoder().encode(envelope) else { return }
-        try? FileManager.default.createDirectory(at: ReceiptStore.defaultDirectory(), withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: fileURL, options: .atomic)
     }
 
-    public static func load(rootPath: String) -> ScanResult? {
+    public static func load(rootPath: String, from source: URL? = nil) -> ScanResult? {
+        let fileURL = source ?? Self.fileURL
         guard let data = try? Data(contentsOf: fileURL),
               let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
               envelope.version == version,

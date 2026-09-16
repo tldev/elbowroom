@@ -4,6 +4,33 @@ import XCTest
 /// Tool-mediated cleanup: the tool's own listing becomes the plan, and
 /// every argv shown is the argv run.
 final class DevToolsTests: XCTestCase {
+    func testRunnerDrainsStderrWhileStdoutIsOpen() async throws {
+        let output = try await ToolRunner.run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            args: ["-c", "i=0; while [ $i -lt 10000 ]; do printf 'error output filling the pipe\\n' >&2; i=$((i + 1)); done; printf done"],
+            timeout: 10
+        )
+        XCTAssertEqual(output.status, 0)
+        XCTAssertEqual(String(data: output.stdout, encoding: .utf8), "done")
+        XCTAssertEqual(output.stderr.split(separator: "\n").count, 10000)
+    }
+
+    func testRunnerReportsTimeout() async throws {
+        do {
+            _ = try await ToolRunner.run(executable: URL(fileURLWithPath: "/bin/sleep"),
+                                         args: ["10"], timeout: 0.1)
+            XCTFail("expected a timeout")
+        } catch ToolRunner.RunError.timedOut {
+            // The deadline, rather than an arbitrary signal, caused the exit.
+        }
+    }
+
+    func testRunnerDoesNotLabelEverySignalAsTimeout() async throws {
+        let output = try await ToolRunner.run(executable: URL(fileURLWithPath: "/bin/sh"),
+                                               args: ["-c", "kill -TERM $$"], timeout: 10)
+        XCTAssertNotEqual(output.status, 0)
+    }
+
     func testSimctlPlanFromToolJSON() throws {
         let devicesJSON = """
         {"devices": {
@@ -26,10 +53,8 @@ final class DevToolsTests: XCTestCase {
           "state": "Ready", "deletable": true, "sizeBytes": 8100000000}}
         """.data(using: .utf8)!
 
-        let cutoff = ISO8601DateFormatter().date(from: "2026-04-01T00:00:00Z")!
         let (deviceActions, keptCount) = SimCleanup.devicePlan(
-            devices: SimctlParser.devices(fromJSON: devicesJSON),
-            staleCutoff: cutoff
+            devices: SimctlParser.devices(fromJSON: devicesJSON)
         )
         let deviceIDs = deviceActions.map(\.id)
         XCTAssertTrue(deviceIDs.contains("sim.unavailable"), "unavailable devices roll into one action")
@@ -54,62 +79,6 @@ final class DevToolsTests: XCTestCase {
         let runtime = runtimeActions.first { $0.id == "sim.runtime.11111111-1111" }!
         XCTAssertEqual(runtime.argv, ["simctl", "runtime", "delete", "11111111-1111"])
         XCTAssertEqual(runtime.bytes, 7_800_000_000)
-    }
-
-    func testRuntimeOffloadRows() {
-        let runtimesJSON = """
-        {"11111111-1111": {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-17-5",
-          "version": "17.5", "build": "21F79", "platformIdentifier": "com.apple.platform.iphonesimulator",
-          "state": "Ready", "deletable": true, "sizeBytes": 7800000000,
-          "path": "/System/Library/AssetsV2/aa.asset/AssetData/Restore/094-1.dmg"},
-         "22222222-2222": {"identifier": "com.apple.CoreSimulator.SimRuntime.iOS-18-2",
-          "version": "18.2", "build": "22C150", "platformIdentifier": "com.apple.platform.iphonesimulator",
-          "state": "Ready", "deletable": true, "sizeBytes": 8100000000,
-          "path": "/System/Library/AssetsV2/bb.asset/AssetData/Restore/094-2.dmg"}}
-        """.data(using: .utf8)!
-        let runtimes = SimctlParser.runtimes(fromJSON: runtimesJSON)
-
-        let (actions, kept) = SimCleanup.runtimePlan(
-            runtimes: runtimes, offloadDir: "/V/Stash/Runtimes", driveName: "Dev Drive",
-            canReadImage: { _ in true }
-        )
-        XCTAssertTrue(kept.isEmpty, "an offloadable current runtime is a row, not a shrug")
-        let offload = actions.first { $0.id.hasPrefix("sim.offload") }
-        XCTAssertNotNil(offload)
-        XCTAssertFalse(offload!.checked, "offloading the current runtime is never pre-checked")
-        XCTAssertNotNil(offload!.warning)
-        XCTAssertEqual(offload!.preCopy?.from, "/System/Library/AssetsV2/bb.asset/AssetData/Restore/094-2.dmg")
-        XCTAssertEqual(offload!.preCopy?.to, "/V/Stash/Runtimes/iOS 18.2 (22C150).dmg")
-        XCTAssertEqual(offload!.argv, ["simctl", "runtime", "delete", "22222222-2222"])
-
-        var plan = CleanupPlan(tool: .simctl, entryID: "xcode.simRuntimes", actions: actions)
-        plan.actions = plan.actions.map { action in
-            var checked = action
-            checked.checked = true
-            return checked
-        }
-        let lines = plan.commandPreview.split(separator: "\n").map(String.init)
-        let cp = lines.firstIndex { $0.hasPrefix("cp ") }
-        let delete = lines.firstIndex { $0.contains("runtime delete 22222222-2222") }
-        XCTAssertNotNil(cp)
-        XCTAssertNotNil(delete)
-        XCTAssertLessThan(cp!, delete!, "the copy always lands before the delete")
-
-        let (noOffload, kept2) = SimCleanup.runtimePlan(
-            runtimes: runtimes, offloadDir: "/V/Stash/Runtimes", driveName: "Dev Drive",
-            canReadImage: { _ in false }
-        )
-        XCTAssertFalse(noOffload.contains { $0.id.hasPrefix("sim.offload") }, "unreadable image means no offload offer")
-        XCTAssertTrue(noOffload.contains { $0.id.hasPrefix("sim.runtime.current.") && !$0.checked },
-                      "the plain unchecked delete offer stands in")
-        XCTAssertTrue(kept2.isEmpty)
-
-        let backs = SimCleanup.addBackActions(
-            imagePaths: ["/V/Stash/Runtimes/iOS 18.2 (22C150).dmg"], driveName: "Dev Drive"
-        )
-        XCTAssertEqual(backs.count, 1)
-        XCTAssertEqual(backs[0].argv, ["simctl", "runtime", "add", "/V/Stash/Runtimes/iOS 18.2 (22C150).dmg"])
-        XCTAssertFalse(backs[0].checked)
     }
 
     /// The sole runtime belongs to the user like everything else: offered
@@ -302,38 +271,6 @@ final class AskKibiParseTests: XCTestCase {
     }
 }
 
-final class ReclaimPlanTests: XCTestCase {
-    private func item(_ id: String, bytes: Int64, entry: String = "js.npmCache") -> AtlasItem {
-        AtlasItem(entryID: entry, url: URL(fileURLWithPath: "/tmp/\(id)"), bytes: bytes, lastTouched: nil)
-    }
-
-    /// The free portion always reclaims; the paywall never blocks it.
-    func testFreeSplitBoundary() {
-        let plan = ReclaimPlan(items: [
-            item("a", bytes: 6_000_000_000),
-            item("b", bytes: 3_000_000_000),
-            item("c", bytes: 4_000_000_000),
-        ])
-        let split = plan.freeSplit(remainingAllowance: 10_000_000_000)
-        XCTAssertEqual(split.now.map(\.id), ["/tmp/a", "/tmp/b"])
-        XCTAssertEqual(split.withPro.map(\.id), ["/tmp/c"])
-    }
-
-    func testFreeSplitProUnlimited() {
-        let plan = ReclaimPlan(items: [item("a", bytes: 50_000_000_000)])
-        let split = plan.freeSplit(remainingAllowance: .max)
-        XCTAssertEqual(split.now.count, 1)
-        XCTAssertTrue(split.withPro.isEmpty)
-    }
-
-    func testZeroAllowanceBlocksAll() {
-        let plan = ReclaimPlan(items: [item("a", bytes: 1)])
-        let split = plan.freeSplit(remainingAllowance: 0)
-        XCTAssertTrue(split.now.isEmpty)
-        XCTAssertEqual(split.withPro.count, 1)
-    }
-}
-
 final class UpdatePlannerTests: XCTestCase {
     private func item(_ id: String, entry: String, bytes: Int64, daysStale: Int) -> AtlasItem {
         AtlasItem(
@@ -352,7 +289,7 @@ final class UpdatePlannerTests: XCTestCase {
             item("fresh", entry: "xcode.derivedData", bytes: 30_000_000_000, daysStale: 2),
             item("docker", entry: "docker.data", bytes: 60_000_000_000, daysStale: 5),
         ]
-        let plan = UpdatePlanner.compose(need: 22_000_000_000, items: items, hasStash: false)
+        let plan = UpdatePlanner.compose(need: 22_000_000_000, items: items)
         // Regenerables first, stalest first.
         XCTAssertEqual(plan.reclaimItems.first?.id, "/tmp/cache1")
         // Fresh rebuildables (< 30 days) never picked.
@@ -365,13 +302,6 @@ final class UpdatePlannerTests: XCTestCase {
         XCTAssertLessThanOrEqual(plan.promisedBytes, Int64(Double(22_000_000_000) * 1.15) + 20_000_000_000)
     }
 
-    func testStashSuggestionsOnlyWithStash() {
-        let items = [
-            item("dd", entry: "xcode.derivedData", bytes: 5_000_000_000, daysStale: 60),
-        ]
-        let without = UpdatePlanner.compose(need: 50_000_000_000, items: items, hasStash: false)
-        XCTAssertTrue(without.stashSuggestions.isEmpty)
-    }
 }
 
 final class TreemapTests: XCTestCase {
@@ -419,14 +349,14 @@ final class TreemapTests: XCTestCase {
 
     /// The rest of a big directory folds into one aggregate slice.
     func testSlicesAggregateTail() {
-        let root = ScanNode(url: URL(fileURLWithPath: "/x"), isDirectory: true, parent: nil)
+        let root = ScanNodeBuilder(url: URL(fileURLWithPath: "/x"), isDirectory: true, parent: nil)
         for i in 0..<50 {
-            let n = ScanNode(url: URL(fileURLWithPath: "/x/c\(i)"), isDirectory: true, parent: root)
+            let n = ScanNodeBuilder(url: URL(fileURLWithPath: "/x/c\(i)"), isDirectory: true, parent: root)
             n.allocatedBytes = Int64(1000 - i)
             root.children.append(n)
             root.allocatedBytes += n.allocatedBytes
         }
-        let slices = Treemap.slices(of: root, limit: 40)
+        let slices = Treemap.slices(of: root.snapshot(), limit: 40)
         XCTAssertEqual(slices.count, 41)
         XCTAssertNil(slices.last!.node)
         let sum = slices.reduce(Int64(0)) { $0 + $1.bytes }

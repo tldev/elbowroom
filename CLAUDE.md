@@ -1,8 +1,16 @@
 # Elbowroom
 
-Elbowroom explains every gigabyte on a small-disk Mac, reclaims what regenerates,
-and offloads the rest. Build, test, and layout: see README.
+Elbowroom explains every gigabyte on a small-disk Mac and reclaims what
+regenerates. Build, test, and layout: see README.
 
+- Distribution is direct download only: Developer ID signing and notarization.
+  The Mac App Store and App Sandbox are explicitly out of scope. Do not add
+  sandbox builds, App Store submission work, or App Store permissions.
+- All features are free, with no paid tier, purchase flow, or reclaim allowance.
+- Offloading to external drives is retired. Do not reintroduce it.
+- Keep task completion inside Elbowroom. Request macOS authorization in context
+  when needed; do not substitute Finder or Terminal instructions for an operation
+  the user requested in the app. Never bypass OS authorization or collect passwords.
 - Tom (the founder) runs `dist/Elbowroom.app` with his real data. Never reset its
   state or quit/relaunch it without asking. Verify UI with
   `swift run ElbowroomSnapshots`, not by driving his live app.
@@ -10,6 +18,6 @@ and offloads the rest. Build, test, and layout: see README.
   pair and an audit entry. Plain and literal, verbs on buttons, no em-dashes,
   no exclamation points, no marketing. Tests enforce this.
 - New surfaces are items on the existing rails (suggestions, Items table,
-  headroom), never bespoke cards or chrome.
+  headroom) — never bespoke cards or chrome.
 - The product's identity: explain before acting, show the literal command,
   verify before destroying, measure rather than promise.

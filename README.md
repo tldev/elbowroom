@@ -1,109 +1,34 @@
 # Elbowroom
 
-**Room to build.** Elbowroom explains every gigabyte on a small-disk Mac,
-reclaims what regenerates, and offloads the rest to an external drive.
-Native macOS, SwiftUI, no dependencies, nothing leaves your machine.
+**Room to build.** Elbowroom explains every gigabyte on a small-disk Mac and
+reclaims what regenerates. Native macOS, SwiftUI, no dependencies.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/overview-dark.png">
-  <img src="docs/images/overview-light.png" alt="Elbowroom Overview: headroom strip, ready-to-reclaim total, and the biggest wins ranked by size" width="1080">
-</picture>
+The premise: a full developer disk is a comprehension problem wearing a storage
+costume. Nobody tells you that a simulator runtime is a re-downloadable OS
+image or that `target/` rebuilds itself. Elbowroom names things, rates them for
+safety, and acts only with informed consent — explanation before action,
+receipts after it. Six types govern everything: **Cache** (refills itself),
+**Derived** (your tools remake it), **App-managed** (another app owns it;
+Elbowroom opens its controls or runs its tool), **Apps** (applications plus the
+data they keep; uninstalling asks about both), **Personal** (untouchable),
+**System** (macOS itself — explained, never gray, with the lever named where
+one exists).
 
-## The premise
+Working rules for contributors and agents live in [`CLAUDE.md`](CLAUDE.md).
 
-A full developer disk is a comprehension problem wearing a storage costume.
-Nobody tells you that a simulator runtime is a re-downloadable OS image, that
-`DerivedData` remakes itself on the next build, or that Docker's 60 GB virtual
-disk is mostly reclaimable from inside Docker. Elbowroom names these things,
-rates them for safety, and acts only with informed consent: explanation before
-action, receipts after it.
-
-Four tiers govern everything:
-
-- **Regenerable**: refills itself (caches, package registries).
-- **Rebuildable**: your tools remake it (`DerivedData`, `target/`, `node_modules`).
-- **Managed**: another app owns it; Elbowroom opens that app's controls or runs
-  its official tool.
-- **Yours**: untouchable. Never suggested, never counted in promises.
-
-## How it differs from DaisyDisk and the others
-
-Disk mappers (DaisyDisk, GrandPerspective, OmniDiskSweeper) answer *what is
-big*. They hand you a beautiful map and a delete key, and then it is your job
-to know whether `CoreSimulator/Devices` is safe to remove. One-button cleaners
-(CleanMyMac and friends) go the other way: they promise a number, delete by
-private rulebook, and you find out later what the button meant.
-
-Elbowroom answers the question in between, the one that actually stalls you:
-*what is this, and what happens if it goes away?*
-
-- **It knows what things are.** An atlas of developer and system storage
-  (Xcode, JavaScript, Rust, Homebrew, Docker/OrbStack, ML weights, device
-  backups, Time Machine local snapshots) names each item in plain language,
-  with the cost of regeneration measured, not guessed: "Rebuilding this next
-  time takes about 60 min."
-- **It shows the literal command.** Where the owning tool can clean up safely,
-  Elbowroom runs `simctl`, `docker`, `brew`, or `tmutil` and shows you the
-  exact command first. Copy it and run it yourself if you prefer; the result
-  is identical.
-- **It deletes nothing behind a tool's back.** No reaching into Docker's
-  virtual disk or Xcode's caches with `rm`. Managed data goes through the
-  manager.
-- **Trash first, receipts after.** Reclaims move to the Trash with Put Back
-  intact, then a receipt records what was removed and how much space actually
-  came back. Measured, not promised.
-- **It can offload instead of delete.** Journaled copy, verify, then
-  symlink-swap moves cold projects to an external APFS drive, crash-safe at
-  every boundary, reversible with one switch.
-- **Private by construction.** The scan is read-only and touches no network.
-  Explanations from the on-device model are visibly hedged as guesses and
-  never count toward the reclaimable number.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/cleanup-docker-dark.png">
-  <img src="docs/images/cleanup-docker-light.png" alt="Tool-mediated cleanup sheet showing the literal docker commands Elbowroom will run" width="560">
-</picture>
-
-## What it looks like
-
-**Items** is the dense table and the accessibility backbone: every finding
-with size, tier, last-touched date, and the honest path.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/items-dark.png">
-  <img src="docs/images/items-light.png" alt="Items table: name, size, tier, last touched, and per-item actions" width="1080">
-</picture>
-
-**Reclaim plans** spell out what each removal costs before you commit.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/reclaim-plan-dark.png">
-  <img src="docs/images/reclaim-plan-light.png" alt="Reclaim plan with per-item rebuild cost and Trash-first execution" width="640">
-</picture>
-
-**Offload** moves cold, heavy folders to an external drive and back again the
-same way, any time.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/offload-dark.png">
-  <img src="docs/images/offload-light.png" alt="Offload catalog with per-folder Local/Offloaded switches and Move everything back" width="620">
-</picture>
-
-Other views: **Map** (an honest squarified treemap, area proportional to
-bytes, tint by tier) and **History** (weekly deltas). A persistent disk strip
-keeps the live headroom figure in sight, and a Steward plans for updates:
-"macOS needs 22 GB; here's the plan."
-
-Full English and Japanese localization, copy rules test-enforced in both.
+Elbowroom is distributed directly with Developer ID signing and notarization.
+All features are free with no usage cap, paid tier, or purchase flow.
+Mac App Store distribution, App Sandbox, and external-drive offloading are not supported.
+The original product spec and vision doc are retired; they remain in git
+history (`docs/`, removed 2026-07).
 
 ## Build & run
 
 ```sh
-swift build                        # debug build
-swift test                         # engine, atlas, planners, stash crash matrix, tool parsers, copy rules (en+ja)
-swift run ElbowroomSnapshots       # design-QA fixture renders to Design/snapshots/ (both appearances)
-Scripts/make-app.sh                # dist/Elbowroom.app, unsandboxed; stable signing identity keeps TCC grants across rebuilds
-Scripts/make-app.sh release --sandbox   # signed + App Sandbox entitlements (App Store shape)
+swift build                      # debug build
+swift test                       # engine, atlas, planners, tool parsers, copy rules (en+ja)
+swift run ElbowroomSnapshots        # design-QA fixture renders → Design/snapshots/ (both appearances)
+Scripts/make-app.sh              # dist/Elbowroom.app, unsandboxed; stable signing identity keeps TCC grants across rebuilds
 open dist/Elbowroom.app
 ```
 
@@ -112,9 +37,7 @@ Apple Intelligence; it hides itself elsewhere). `open Package.swift` works in
 Xcode too.
 
 Regenerable assets: `Scripts/gensounds.py` (UI sounds),
-`Scripts/genicon.swift` (app icon to `Assets/AppIcon.icns`).
-
-Working rules for contributors and agents live in [`CLAUDE.md`](CLAUDE.md).
+`Scripts/genicon.swift` (app icon → `Assets/AppIcon.icns`).
 
 ## Layout
 
@@ -130,22 +53,94 @@ Sources/ElbowroomKit/
   Lenses/                      Detectors that name "Everything else" (media
                                piles, installers, twins, VMs, weights, games)
   Reclaim/                     Plan + trash-first executor + receipts
-  Stash/                       Manifest, journaled move state machine,
-                               Guardian, speed test
   Steward/UpdatePlanner.swift  Greedy update-plan composition
   Tools/                       Tool-mediated cleanup: simctl, docker, brew,
-                               tmutil (snapshots), literal-command sheets
-  Support/                     TeachFlows, ChangeLog, stores, purchases,
+                               tmutil (snapshots) — literal-command sheets
+  Support/                     TeachFlows, ChangeLog, stores,
                                sounds, local-only analytics, Fixtures
-  Components/                  TierChip, ByteCounter, DiskStrip, StashToggle...
+  Components/                  TierChip, ByteCounter, DiskStrip, LegendPanel…
   Views/                       Onboarding, Overview, Map (squarified treemap),
                                Items, History, sheets, Settings
-Sources/Elbowroom/ElbowroomApp.swift   App entry: window, Settings, Guardian menu bar
-Sources/ElbowroomSnapshots/    Offscreen fixture renderer for design QA
-Sources/ElbowroomBench/        Scan benchmark + legacy-walk A/B harness
-Tests/ElbowroomTests/          Engine, stash kill -9 recovery matrix, tool
-                               parsers, bilingual copy-rule audits
+Sources/Elbowroom/ElbowroomApp.swift App entry: window, Settings, Steward menu bar
+Sources/ElbowroomSnapshots/       Offscreen fixture renderer for design QA
+Sources/ElbowroomBench/           Scan benchmark + bulk-read diagnostic harness
+Tests/ElbowroomTests/             Engine, tool parsers, bilingual copy-rule
+                               audits
 ```
+
+## Architecture and performance
+
+[Architecture](Design/architecture.md) describes ownership, I/O boundaries, and
+how to add integrations. [Performance](Design/performance.md) documents repeatable
+release benchmarks and the measured tradeoffs.
+
+```sh
+swift run -c release ElbowroomBench metrics /path/to/fixture --items 10000 --iters 5
+swift run -c release ElbowroomSnapshots /tmp/elbowroom-ui --performance --items 10000
+```
+
+The UI harness uses isolated stores and an offscreen window. It measures launch,
+search, scrolling layout, and cache restore without opening the live app.
+
+## Product shape (current)
+
+- **Views:** Overview (briefing: hero headroom, biggest wins, side cards) ·
+  Map (honest squarified treemap, area ∝ bytes) · Items (a flat table that combines related storage
+  across locations into one row) · History (weekly deltas). A persistent Disk Strip
+  shows the live headroom figure.
+- **Scan:** read-only bulk-attribute walk with FSEvents deltas; purgeable and
+  snapshots measured and labeled; denied paths disclosed, never silently
+  skipped.
+- **Atlas packs:** Xcode, JavaScript, Rust, Homebrew, Docker/OrbStack, system
+  residue (device backups, snapshots, app caches), ML weights. Lenses name
+  the long tail (findings are ordinary items). Recognized groups also include
+  pip, uv, and Gradle caches, plus Music, TV, iMovie, Final Cut Pro, and Aperture
+  library bundles. Personal libraries are explained without deletion suggestions.
+  “Everything else” is a recognition backlog: naming more storage is valuable
+  even when it cannot be recommended for cleanup.
+- **Reclaim:** informed-consent plan, Trash-first, receipts + CSV + Put Back,
+  no reclaim limits or paid upgrades.
+- **Tool-mediated cleanup:** where the owning tool can do it safely (simctl,
+  docker, brew, tmutil for Time Machine local snapshots), Elbowroom shows the
+  literal commands, runs them one at a time, and writes measured receipts.
+  Snapshot deletion carries backup-destination reassurance and an opt-in
+  auto-trim (macOS removed its own off switch).
+- **Applications:** supported caches have their own cleanup items. Each app
+  is an item whose remaining size includes its `~/Library`
+  residue (App Support, Caches, Containers, and friends, matched
+  conservatively by bundle id or exact name). Uninstall opens the ordinary
+  trash-first plan — the bundle plus one row per residue location, each the
+  user's to uncheck.
+- **System:** the container's sibling volumes become items — macOS itself,
+  the update staging area (with a Software Update door), and swap — so the
+  ~40 GB no file walk can see is named instead of gray.
+- **Steward:** update planner ("macOS needs 22 GB; here's the plan"), quiet
+  notification budget.
+- **Explain:** on-device model describes unknown folders ≥ 500 MB; guesses
+  are visually hedged and never count toward promises.
+- **Localization:** full English + Japanese, copy rules test-enforced in both.
+
+## Screenshots
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/overview-dark.png">
+  <img src="docs/images/overview-light.png" alt="Overview with disk usage and cleanup suggestions" width="1080">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/items-dark.png">
+  <img src="docs/images/items-light.png" alt="Items grouped by purpose with sizes and cleanup actions" width="1080">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/reclaim-plan-dark.png">
+  <img src="docs/images/reclaim-plan-light.png" alt="Reclaim plan with per-item review and Trash-first execution" width="640">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/cleanup-docker-dark.png">
+  <img src="docs/images/cleanup-docker-light.png" alt="Docker cleanup with the commands shown before execution" width="560">
+</picture>
 
 ## Design language
 
@@ -157,10 +152,6 @@ with `swift run ElbowroomSnapshots` before shipping.
 
 ## Remaining external steps (not code)
 
-- **App Store Connect:** create the `io.elbowroom.pro` IAP so StoreKit returns
-  a product; notarize the Developer ID build for distribution outside the
-  store.
-- **Stash walkthrough on hardware:** the full-disk grant, offload, unplug,
-  reconcile loop on a physical external drive, once per release.
+- **Distribution:** notarize the Developer ID build for direct download.
 - **Japanese review:** the ja table is authored for native review before
-  submission.
+  release.
