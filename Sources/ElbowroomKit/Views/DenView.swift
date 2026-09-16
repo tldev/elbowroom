@@ -23,7 +23,6 @@ public struct DenView: View {
                 .frame(maxWidth: .infinity)
                 VStack(alignment: .leading, spacing: 14) {
                     thisWeekCard
-                    offloadCard
                     updateCard
                     allTimeCard
                 }
@@ -57,7 +56,7 @@ public struct DenView: View {
                             .kerning(0.7)
                             .foregroundStyle(BColor.inkSoft)
                     }
-                    ByteCounter(bytes: model.headroomBytes, size: 52)
+                    ByteCounter(bytes: model.solidReclaimable, size: 52)
                     Text(Copy.heroExplainer)
                         .font(BFont.body)
                         .foregroundStyle(BColor.inkSoft)
@@ -68,16 +67,10 @@ public struct DenView: View {
                 VStack(alignment: .trailing, spacing: BSpace.s) {
                     PrimaryButton(Copy.reclaimPrimary(ByteFormat.string(model.solidReclaimable))) {
                         let plan = model.items.filter {
-                            !$0.isStashed && ($0.entry.tier == .regenerable || $0.entry.tier == .rebuildable)
+                            $0.entry.tier == .regenerable || $0.entry.tier == .rebuildable
                         }
                         model.openReclaimPlan(items: plan.sorted { $0.bytes > $1.bytes })
                     }
-                    Button("\(Copy.offloadInstead)…") {
-                        model.sheet = model.stash == nil ? .stashSetup : .stashCatalog
-                    }
-                    .buttonStyle(.plain)
-                    .font(BFont.body)
-                    .foregroundStyle(BColor.inkSoft)
                 }
             }
             // The reclaimable composition, tier by tier.
@@ -112,12 +105,10 @@ public struct DenView: View {
 
     private var reclaimComposition: [(tier: Tier, bytes: Int64)] {
         var byTier: [Tier: Int64] = [:]
-        for item in model.items where !item.isStashed {
+        for item in model.items {
             switch item.entry.tier {
             case .regenerable, .rebuildable:
                 byTier[item.entry.tier, default: 0] += item.bytes
-            case .managed where item.entry.teachFlow != nil:
-                byTier[.managed, default: 0] += item.bytes
             default: break
             }
         }
@@ -162,7 +153,7 @@ public struct DenView: View {
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(BColor.ink)
                     Spacer()
-                    Button("\(Copy.allItemsLink(model.items.count)) →") {
+                    Button("\(Copy.allStorageItems) →") {
                         model.ledgerTierFilter = nil
                         model.view = .ledger
                     }
@@ -207,13 +198,16 @@ public struct DenView: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(BColor.inkSoft)
-                Text("\(Copy.everythingElse) · \(ByteFormat.string(model.everythingElseBytes))")
-                    .font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(BColor.ink)
-                Text(Copy.lensDenLine)
-                    .font(BFont.body)
-                    .foregroundStyle(BColor.inkSoft)
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(Copy.everythingElse) · \(ByteFormat.string(model.everythingElseBytes))")
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(BColor.ink)
+                    Text(model.remainingStorageExplanation)
+                        .font(BFont.body)
+                        .foregroundStyle(BColor.inkSoft)
+                        .lineLimit(2)
+                }
+                .help(Copy.remainingStorageDetail)
                 Spacer()
                 Text("\(Copy.openMapLink) →")
                     .font(.system(size: 12.5, weight: .semibold))
@@ -258,38 +252,6 @@ public struct DenView: View {
                         .padding(.top, 2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .bCard()
-        }
-    }
-
-    /// The offload drive as a first-class card: name, state, holdings, door.
-    @ViewBuilder
-    private var offloadCard: some View {
-        if let stash = model.stash {
-            let entries = stash.manifest.entries.filter {
-                $0.status == .done || $0.status == .doneDirty || $0.status == .committed
-            }
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
-                    Image(systemName: stash.volumeIsPresent ? "externaldrive.fill" : "externaldrive.badge.exclamationmark")
-                        .font(.system(size: 15))
-                        .foregroundStyle(stash.volumeIsPresent ? BColor.brand : BColor.tierRebuild)
-                    Text(stash.volumeName)
-                        .font(BFont.body.weight(.semibold))
-                        .foregroundStyle(BColor.ink)
-                    if !stash.volumeIsPresent {
-                        Text(Copy.stashNotConnected)
-                            .font(BFont.meta)
-                            .foregroundStyle(BColor.tierRebuild)
-                    }
-                }
-                Text(Copy.trayCount(entries.count, ByteFormat.string(stash.stashedBytes)))
-                    .font(BFont.meta)
-                    .foregroundStyle(BColor.inkSoft)
-                Button(Copy.stashTitle) { model.sheet = .stashCatalog }
-                    .buttonStyle(SecondarySmallButtonStyle())
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .bCard()
@@ -372,13 +334,13 @@ struct SuggestionCard: View {
                     .fill(item.entry.tier.color)
                     .frame(width: 9, height: 9)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(item.displayName)
+                    Text(suggestion.title)
                         .font(.system(size: 13.5, weight: .semibold))
                         .foregroundStyle(BColor.ink)
                     Text(suggestion.line)
                         .font(BFont.meta)
                         .foregroundStyle(BColor.inkSoft)
-                        .lineLimit(1)
+                        .lineLimit(2)
                 }
                 Spacer()
                 if hover {
@@ -392,7 +354,7 @@ struct SuggestionCard: View {
                     .buttonStyle(.plain)
                     .help(Copy.hideThirtyDays)
                 }
-                Text(ByteFormat.string(item.bytes))
+                Text(suggestion.members.isEmpty ? Copy.groupTotal(ByteFormat.string(suggestion.bytes)) : ByteFormat.string(suggestion.bytes))
                     .font(BFont.rounded(13.5, .bold))
                     .foregroundStyle(BColor.ink)
                 action(item)
@@ -408,39 +370,29 @@ struct SuggestionCard: View {
 
     private var accessibilityLine: String {
         guard let item = suggestion.item else { return suggestion.line }
-        return "\(item.displayName), \(ByteFormat.string(item.bytes)), \(item.entry.tier.label)"
+        return "\(suggestion.title), \(ByteFormat.string(suggestion.bytes)), \(item.entry.tier.label)"
     }
 
     /// Selectable rows toggle the plan; everything else keeps its verb.
     @ViewBuilder
     private func action(_ item: AtlasItem) -> some View {
-        if model.canSelect(item) {
+        if !suggestion.members.isEmpty {
+            Button(Copy.reviewCleanup) { model.openReclaimPlan(items: suggestion.members) }
+                .buttonStyle(PlanToggleButtonStyle(on: false))
+        } else if model.canSelect(item) {
             let inPlan = model.trayItems.contains(item)
             Button(inPlan ? "\(Copy.inPlan) ✓" : Copy.addToPlan) {
                 withAnimation(BMotion.light) { model.toggleTray(item) }
             }
             .buttonStyle(PlanToggleButtonStyle(on: inPlan))
         } else {
-            Button(suggestion.verb) { act(item) }
+            Button(suggestion.action.title) { model.perform(suggestion.action, on: item) }
                 .buttonStyle(PlanToggleButtonStyle(on: false))
-                .accessibilityLabel(suggestion.verb)
+                .accessibilityLabel(suggestion.action.title)
         }
     }
 
-    private func act(_ item: AtlasItem) {
-        switch suggestion.verb {
-        case Copy.trayStash:
-            model.stashItem(item)
-        case Copy.cleanUp:
-            model.sheet = .cleanup(entryID: item.entryID)
-        case Copy.showMe:
-            if let flow = item.entry.teachFlow {
-                model.sheet = .teach(flow, bytes: item.bytes)
-            }
-        default:
-            model.openReclaimPlan(items: [item])
-        }
-    }
+
 }
 
 /// The add-to-plan pill: bordered at rest, accent-soft once in the plan.

@@ -5,7 +5,8 @@ import ElbowroomKit
 ///
 ///   elbowroom-bench gen <path> [--files N]     build a synthetic dev-home fixture
 ///   elbowroom-bench scan <path> [--iters N]    time full scans of a tree
-///   elbowroom-bench compare <path>             legacy vs current engine, diff results
+///   elbowroom-bench dircheck <path>            compare bulk and FileManager reads
+///   elbowroom-bench scanfp <path> <outfile>     write a scan fingerprint
 ///
 /// The fixture mimics a developer home: repos with node_modules, DerivedData,
 /// caches, downloads, deep chains, symlinks — so classification, repo
@@ -122,8 +123,7 @@ struct FixtureGen {
 
 // MARK: - Scan timing
 
-@discardableResult
-func timedScan(root: URL, quiet: Bool = false) async throws -> (ScanResult, Double) {
+func timedScan(root: URL) async throws -> (ScanResult, Double) {
     let engine = ScanEngine()
     let t0 = DispatchTime.now()
     var result: ScanResult?
@@ -134,12 +134,10 @@ func timedScan(root: URL, quiet: Bool = false) async throws -> (ScanResult, Doub
     }
     let dt = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
     guard let result else { fatalError("scan never finished") }
-    if !quiet {
-        let mb = Double(result.scannedBytes) / 1e6
-        print(String(format: "  %.3fs  bytes=%.1fMB items=%d findings=%d denied=%d events=%d",
-                     dt, mb, result.items.count, result.lensFindings.count,
-                     result.deniedPaths.count, events))
-    }
+    let mb = Double(result.scannedBytes) / 1e6
+    print(String(format: "  %.3fs  bytes=%.1fMB items=%d findings=%d denied=%d events=%d",
+                 dt, mb, result.items.count, result.lensFindings.count,
+                 result.deniedPaths.count, events))
     return (result, dt)
 }
 
@@ -149,10 +147,10 @@ func summarize(_ label: String, _ times: [Double]) {
     print(String(format: "%@: best %.3fs  avg %.3fs  (n=%d)", label, best, avg, times.count))
 }
 
-// MARK: - Result fingerprint (equivalence checks between engines)
+// MARK: - Result fingerprint (regression comparisons)
 
 /// /private/tmp and /tmp (same for /var) are one place with two spellings;
-/// legacy FileManager children come back canonical while the standardized
+/// FileManager children can come back canonical while the standardized
 /// root does not. Normalize so the diff shows real divergence only.
 func normalizePrefix(_ s: String) -> String {
     s.replacingOccurrences(of: "/private/tmp/", with: "/tmp/")
@@ -171,11 +169,11 @@ func fingerprint(_ r: ScanResult) -> [String] {
     for d in r.deniedPaths.sorted() {
         lines.append("denied \(d)")
     }
-    func walk(_ n: ScanNode, depth: Int) {
+    func walk(_ n: ScanNode) {
         lines.append("node \(n.path) b=\(n.allocatedBytes) c=\(n.collapsedCount) cb=\(n.collapsedBytes) atlas=\(n.atlasEntryID ?? "-") dl=\(n.isDataless)")
-        for c in n.children { walk(c, depth: depth + 1) }
+        for c in n.children { walk(c) }
     }
-    walk(r.root, depth: 0)
+    walk(r.root)
     return lines.map(normalizePrefix)
 }
 
@@ -183,7 +181,7 @@ func fingerprint(_ r: ScanResult) -> [String] {
 
 let args = CommandLine.arguments
 guard args.count >= 3 else {
-    print("usage: elbowroom-bench gen|scan|compare <path> [--files N] [--iters N]")
+    print("usage: elbowroom-bench gen|scan|dircheck|scanfp|metrics <path> [--files N] [--iters N]")
     exit(1)
 }
 let mode = args[1]
@@ -195,14 +193,13 @@ func flag(_ name: String, default def: Int) -> Int {
     return def
 }
 
-let sema = DispatchSemaphore(value: 0)
-Task {
+do {
     switch mode {
     case "gen":
         var gen = FixtureGen(root: root)
         gen.run(targetFiles: flag("--files", default: 100_000))
     case "scan":
-        let iters = flag("--iters", default: 3)
+        let iters = max(1, flag("--iters", default: 3))
         var times: [Double] = []
         for i in 0..<iters {
             print("iter \(i + 1)/\(iters)")
@@ -210,30 +207,49 @@ Task {
             times.append(dt)
         }
         summarize("scan \(root.path)", times)
-    case "compare":
-        setenv("ELBOWROOM_SCAN_LEGACY", "1", 1)
-        print("legacy engine:")
-        let (legacy, lt) = try await timedScan(root: root)
-        unsetenv("ELBOWROOM_SCAN_LEGACY")
-        print("current engine:")
-        let (fast, ft) = try await timedScan(root: root)
-        let a = fingerprint(legacy), b = fingerprint(fast)
-        let sa = Set(a), sb = Set(b)
-        let onlyA = a.filter { !sb.contains($0) }, onlyB = b.filter { !sa.contains($0) }
-        print(String(format: "legacy %.3fs → current %.3fs  (%.2fx)", lt, ft, lt / ft))
-        if onlyA.isEmpty && onlyB.isEmpty {
-            print("results IDENTICAL (\(a.count) fingerprint lines)")
-        } else {
-            print("DIFFERENCES — only in legacy: \(onlyA.count), only in current: \(onlyB.count)")
-            for l in onlyA.prefix(40) { print("  L \(l)") }
-            for l in onlyB.prefix(40) { print("  C \(l)") }
+    case "metrics":
+        let iterations = max(1, flag("--iters", default: 5))
+        let count = max(1, flag("--items", default: 10_000))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("elbowroom-metrics-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = directory.appendingPathComponent("scan-cache.json")
+        var fixture = Fixtures.scanResult()
+        fixture.items = (0..<count).map { index in
+            AtlasItem(entryID: "js.nodeModules", url: URL(fileURLWithPath: "/fixture/project-\(index)/node_modules"),
+                      bytes: Int64(count - index) * 4096, lastTouched: .distantPast, projectName: "project-\(index)")
         }
+        func measure(_ phase: String, _ work: () -> Void) {
+            var times: [Double] = []
+            for _ in 0..<iterations {
+                let start = DispatchTime.now().uptimeNanoseconds
+                work()
+                times.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+            }
+            times.sort()
+            print(String(format: "%@: median %.3fms p95 %.3fms (n=%d)", phase,
+                         times[times.count / 2], times[min(times.count - 1, Int(Double(times.count) * 0.95))], times.count))
+        }
+        print("inventory rows: \(count)")
+        measure("cache.save") { ScanCache.save(fixture, rootPath: root.path, to: cache) }
+        measure("cache.load") { precondition(ScanCache.load(rootPath: root.path, from: cache)?.items.count == count) }
+        measure("ledger.project-sort") { precondition(LedgerProjection.rows(items: fixture.items).count == count) }
+        measure("ledger.search-sort") { precondition(!LedgerProjection.rows(items: fixture.items, search: "project-1").isEmpty || count == 1) }
+        measure("treemap.layout") {
+            let slices = Treemap.slices(of: fixture.root)
+            _ = Treemap.layout(items: slices.map { ($0.id, $0.bytes) }, in: CGRect(x: 0, y: 0, width: 1080, height: 600))
+        }
+        print("scan (first run, then warm repeats; OS caches are not flushed):")
+        for _ in 0..<iterations { _ = try await timedScan(root: root) }
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        print(String(format: "peak RSS: %.1f MiB", Double(usage.ru_maxrss) / 1_048_576))
     case "dircheck":
         // Per-entry compare: BulkDir.read vs FileManager, recursively.
         var dirs = [root.path]
         var badEntries = 0
         var checkedDirs = 0
         let buf = UnsafeMutableRawBufferPointer.allocate(byteCount: BulkDir.bufferSize, alignment: 16)
+        defer { buf.deallocate() }
         while let dir = dirs.popLast() {
             checkedDirs += 1
             var bulk: [BulkEntry] = []
@@ -260,7 +276,7 @@ Task {
         }
         print("checked \(checkedDirs) dirs, \(badEntries) differing entries")
     case "scanfp":
-        // Full fingerprint to a file (engine picked via ELBOWROOM_SCAN_LEGACY).
+        // Full fingerprint to a file for regression comparisons.
         guard args.count >= 4 else { print("scanfp <path> <outfile>"); exit(1) }
         let (result, dt) = try await timedScan(root: root)
         let out = fingerprint(result).joined(separator: "\n") + "\n"
@@ -270,6 +286,7 @@ Task {
         print("unknown mode \(mode)")
         exit(1)
     }
-    sema.signal()
+} catch {
+    FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+    exit(1)
 }
-sema.wait()

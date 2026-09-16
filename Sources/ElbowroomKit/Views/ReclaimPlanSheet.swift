@@ -30,7 +30,8 @@ public struct ReclaimPlanSheet: View {
         .onAppear {
             guard !didInit else { return }
             didInit = true
-            checked = Set(model.planItems.map(\.id))
+            // Entries marked planDefaultOff wait for a deliberate tick.
+            checked = Set(model.planItems.filter { !$0.entry.planDefaultOff }.map(\.id))
         }
     }
 
@@ -52,6 +53,11 @@ public struct ReclaimPlanSheet: View {
     private var planList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: BSpace.l) {
+                if model.planItems.contains(where: { $0.entryID == "app.bundle" }) {
+                    Text(Copy.uninstallPermissionHelp)
+                        .font(BFont.meta)
+                        .foregroundStyle(BColor.inkSoft)
+                }
                 ForEach(ReclaimPlan(items: model.planItems).byOwner, id: \.owner) { group in
                     VStack(alignment: .leading, spacing: BSpace.s) {
                         Text(group.owner)
@@ -95,6 +101,19 @@ public struct ReclaimPlanSheet: View {
                         }
                     }
                     .frame(maxWidth: 420)
+                    if let item = model.planItems.first(where: {
+                        outcome.accessDeniedAppPaths.contains($0.url.path)
+                    }) {
+                        Text(Copy.uninstallPermissionHelp)
+                            .font(BFont.meta)
+                            .foregroundStyle(BColor.inkSoft)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: 420)
+                        Button(Copy.uninstallRetry) {
+                            Task { await model.openUninstallPlan(item) }
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                    }
                 } else if outcome.cancelled {
                     Text(Copy.reclaimStopped(outcome.doneCount))
                         .font(BFont.body)
@@ -161,28 +180,7 @@ public struct ReclaimPlanSheet: View {
 
     private var footer: some View {
         @Bindable var model = model
-        let split = ReclaimPlan(items: selectedItems).freeSplit(remainingAllowance: model.pro.remainingAllowance)
-        let freeBytes = split.now.reduce(Int64(0)) { $0 + $1.bytes }
-        let lockedBytes = split.withPro.reduce(Int64(0)) { $0 + $1.bytes }
-
         return VStack(alignment: .leading, spacing: BSpace.m) {
-            if model.reclaimOutcome == nil, !model.reclaiming, lockedBytes > 0 {
-                // The free boundary split; the paywall never blocks the
-                // free part.
-                HStack(spacing: 8) {
-                    Text("\(ByteFormat.string(freeBytes)) now · \(ByteFormat.string(lockedBytes)) with Pro")
-                        .font(BFont.meta.weight(.medium))
-                        .foregroundStyle(BColor.ink)
-                    Text(Copy.paywallBoundary)
-                        .font(BFont.meta)
-                        .foregroundStyle(BColor.inkSoft)
-                    Spacer()
-                    Button(Copy.paywallButton) { model.sheet = .paywall(trigger: "free_boundary") }
-                        .buttonStyle(.plain)
-                        .font(BFont.meta.weight(.semibold))
-                        .foregroundStyle(BColor.brand)
-                }
-            }
             HStack(spacing: BSpace.l) {
                 if model.reclaimOutcome != nil {
                     Spacer()
@@ -203,7 +201,7 @@ public struct ReclaimPlanSheet: View {
                     Spacer()
                     Button(Copy.cancel) { model.closeSheet() }
                         .buttonStyle(SecondaryButtonStyle())
-                    PrimaryButton(Copy.reclaimPrimary(ByteFormat.string(lockedBytes > 0 ? freeBytes : selectedBytes))) {
+                    PrimaryButton(Copy.reclaimPrimary(ByteFormat.string(selectedBytes))) {
                         model.runReclaim(selected: selectedItems)
                     }
                     .disabled(selectedItems.isEmpty)

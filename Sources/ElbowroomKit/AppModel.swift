@@ -4,7 +4,7 @@ import AppKit
 import Observation
 
 public enum OnboardingBeat: Int, Comparable {
-    case welcome, privacy, grant, scanning, reveal
+    case welcome, privacy, trashFirst, grant, scanning, reveal
     public static func < (l: OnboardingBeat, r: OnboardingBeat) -> Bool { l.rawValue < r.rawValue }
 }
 
@@ -31,23 +31,15 @@ public struct Toast: Identifiable, Equatable {
 
 public enum ActiveSheet: Identifiable {
     case reclaimPlan(title: String)
-    case stashSetup
-    case stashCatalog
     case teach(TeachFlowID, bytes: Int64)
     case cleanup(entryID: String)
-    case paywall(trigger: String)
-    case reconcile(StashEntry)
     case updatePlanner
     case askKibi(name: String, path: String, bytes: Int64, children: [String])
     public var id: String {
         switch self {
         case .reclaimPlan: "plan"
-        case .stashSetup: "stashSetup"
-        case .stashCatalog: "stashCatalog"
         case .teach(let id, _): "teach-\(id.rawValue)"
         case .cleanup(let entryID): "cleanup-\(entryID)"
-        case .paywall: "paywall"
-        case .reconcile(let e): "reconcile-\(e.id)"
         case .updatePlanner: "planner"
         case .askKibi(_, let path, _, _): "kibi-\(path)"
         }
@@ -58,12 +50,9 @@ public enum ActiveSheet: Identifiable {
 @MainActor
 public final class AppModel {
     // MARK: Stores
-    public let settings = SettingsStore.shared
-    public let pro = ProStore()
-    public let receipts = ReceiptStore()
-    public let changeLog = ChangeLog()
-    public let guardian = Guardian()
-    public let purchases: PurchaseManager
+    public let settings: SettingsStore
+    public let receipts: ReceiptStore
+    public let changeLog: ChangeLog
 
     // MARK: Onboarding
     public var onboarding: OnboardingBeat = .welcome
@@ -94,8 +83,17 @@ public final class AppModel {
     public var scanBytesSeen: Int64 = 0
     public var scanStartedAt: Date?
     public var slowDisk = false
-    public var result: ScanResult?
+    public let inventory = Inventory()
+    public var result: ScanResult? {
+        get { inventory.result }
+        set {
+            inventory.replace(with: newValue)
+            zoomPath = zoomPath.compactMap { newValue?.root.find(path: $0.path) }
+        }
+    }
     private var scanTask: Task<Void, Never>?
+    private var scanGeneration = 0
+    private let scanCacheURL: URL?
 
     // Ticker: min 900 ms dwell, max 5 visible, queued.
     public var tickerLines: [String] = []
@@ -111,7 +109,7 @@ public final class AppModel {
     public var sheet: ActiveSheet? {
         // Interactive dismissal (Esc, click-out) abandons the whole flow;
         // a stale stack must never resurface under a later sheet.
-        didSet { if sheet == nil { sheetStack = [] } }
+        didSet { if sheet == nil { sheetStack = []; actionTask?.cancel() } }
     }
     /// Sheets the current one slid over; closing returns here, so a flow
     /// like lenses → plan never dead-ends.
@@ -121,7 +119,6 @@ public final class AppModel {
 
     // MARK: Tray
     public var trayItems: [AtlasItem] = []
-    public var trayMode: Tier? // nil until first add; batch rules by tier
 
     // MARK: Reclaim run
     public var reclaiming = false
@@ -131,12 +128,7 @@ public final class AppModel {
     public var planItems: [AtlasItem] = []
     public var planTitle = Copy.planTitle
     private var reclaimTask: Task<Void, Never>?
-
-    // MARK: Stash
-    public var stash: StashManager? {
-        didSet { guardian.stash = stash }
-    }
-    public var stashBusy: Set<String> = [] // AtlasItem ids mid-move
+    private var actionTask: Task<Void, Never>?
 
     // MARK: Tool-mediated cleanup
     public var toolsAvailable: Set<DevTool> = []
@@ -149,12 +141,25 @@ public final class AppModel {
     public var changesPending = false
     private var quietRescanTask: Task<Void, Never>?
 
-    public init() {
-        purchases = PurchaseManager(pro: pro)
-        restoreStashIfKnown()
-        refreshToolCapabilities()
-        receipts.sweepExpired()
-        purchases.start()
+    @ObservationIgnored private var activationObserver: NSObjectProtocol?
+
+    public init(settings: SettingsStore = .shared,
+                receipts: ReceiptStore? = nil, changeLog: ChangeLog? = nil,
+                startServices: Bool = true, scanCacheURL: URL? = nil) {
+        let receipts = receipts ?? ReceiptStore()
+        let changeLog = changeLog ?? ChangeLog()
+        self.scanCacheURL = scanCacheURL
+        self.settings = settings
+        self.receipts = receipts
+        self.changeLog = changeLog
+        if startServices {
+            refreshToolCapabilities()
+            Task {
+                await receipts.loadFromDisk()
+                await changeLog.loadFromDisk()
+                await receipts.sweepExpired()
+            }
+        }
         if isOnboarded {
             onboarding = .reveal
             inMain = true
@@ -169,18 +174,16 @@ public final class AppModel {
             onboarding = .grant
             grantPath = .fdaWaiting
         }
-        NotificationCenter.default.addObserver(
+        guard startServices else { return }
+        activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in self?.refreshFDAStatus() }
         }
     }
 
-    /// After a decline, proactive paywalls stay quiet for 14 days.
-    /// Feature taps the user makes personally still open it.
-    public var paywallCoolingDown: Bool {
-        guard let declined = settings.paywallDeclinedAt else { return false }
-        return Date().timeIntervalSince(declined) < 14 * 86_400
+    deinit {
+        if let activationObserver { NotificationCenter.default.removeObserver(activationObserver) }
     }
 
     // MARK: - Grant
@@ -219,6 +222,7 @@ public final class AppModel {
                 guard !Task.isCancelled else { return }
                 if granted {
                     self.fdaGranted = true
+                    GrantHelperPanel.shared.markGranted()
                     self.acceptGrant(url: URL(fileURLWithPath: "/"))
                     return
                 }
@@ -238,7 +242,9 @@ public final class AppModel {
         onboarding = .grant
     }
 
+    /// The pending uninstall survives, so the new launch resumes it.
     public func relaunchApp() {
+        prepareForRelaunch()
         DiskAccess.relaunch()
     }
 
@@ -307,6 +313,8 @@ public final class AppModel {
         guard let root = scanRoot ?? restoreGrant() else { return }
         scanRoot = root
         scanning = true
+        scanGeneration += 1
+        let generation = scanGeneration
         scanStartedAt = Date()
         slowDisk = false
         scanItemsSeen = 0
@@ -319,6 +327,7 @@ public final class AppModel {
         scanTask = Task {
             do {
                 for try await event in engine.scan(root: root) {
+                    guard generation == self.scanGeneration, !Task.isCancelled else { return }
                     switch event {
                     case .progress(let items, let bytes, let path):
                         self.scanItemsSeen = items
@@ -337,12 +346,14 @@ public final class AppModel {
                     }
                 }
             } catch {
+                guard generation == self.scanGeneration else { return }
                 self.scanning = false
             }
         }
     }
 
     public func cancelScan() {
+        scanGeneration += 1
         scanTask?.cancel()
         scanning = false
         if onboarding == .scanning {
@@ -355,20 +366,15 @@ public final class AppModel {
     }
 
     private func finishScan(_ result: ScanResult) {
-        markStashedItems(in: result)
         self.result = result
         scanning = false
         changesPending = false
         refreshFDAStatus() // the B5 chip hides when FDA already covers everything
         startWatching()
         if let rootPath = scanRoot?.standardizedFileURL.path {
-            Task.detached(priority: .utility) {
-                ScanCache.save(result, rootPath: rootPath)
-            }
+            ScanCache.enqueueSave(result, rootPath: rootPath, to: scanCacheURL)
         }
         changeLog.recordScan(items: result.items, disk: result.disk)
-        // The scan carried the lens post-pass; mirror its findings.
-        lensFindings = result.lensFindings
         refreshDockerBytes()
         autoThinSnapshotsIfNeeded()
         Analytics.shared.log("scan_complete", [
@@ -387,16 +393,6 @@ public final class AppModel {
                     }
                 }
             }
-        }
-    }
-
-    private func markStashedItems(in result: ScanResult) {
-        guard let stash else { return }
-        let stashedPaths = Set(stash.manifest.entries
-            .filter { $0.status == .done || $0.status == .doneDirty || $0.status == .committed }
-            .map(\.sourcePath))
-        for i in result.items.indices where stashedPaths.contains(result.items[i].url.path) {
-            result.items[i].isStashed = true
         }
     }
 
@@ -425,24 +421,11 @@ public final class AppModel {
 
     // MARK: - Derived numbers
 
-    /// One inventory: lens findings are ordinary items, merged
-    /// computed-side so a rescan can never orphan them. They carry the
-    /// Personal band's share of the Disk Strip like any other tier.
-    public var items: [AtlasItem] { (result?.items ?? []) + lensItems }
-
-    /// Derived once per findings change, not on every `items` access: the
-    /// inventory is read many times per render.
-    private var lensItems: [AtlasItem] = []
-
-    private func rebuildLensItems() {
-        lensItems = lensFindings.filter { $0.kind != .stratum }.map {
-            AtlasItem(entryID: "lens.found", url: $0.url, bytes: $0.bytes, lastTouched: $0.date)
-        }
-    }
+    public var items: [AtlasItem] { inventory.items }
 
     /// Solid headroom: bytes Elbowroom can move to the Trash itself.
     public var solidReclaimable: Int64 {
-        items.filter { !$0.isStashed && ($0.entry.tier == .regenerable || $0.entry.tier == .rebuildable) }
+        items.filter { $0.entry.tier == .regenerable || $0.entry.tier == .rebuildable }
             .reduce(0) { $0 + $1.bytes }
     }
 
@@ -452,7 +435,8 @@ public final class AppModel {
             .reduce(0) { $0 + $1.bytes }
     }
 
-    public var headroomBytes: Int64 { solidReclaimable + teachBytes }
+    /// Managed footprints need inspection before they become a savings estimate.
+    public var headroomBytes: Int64 { solidReclaimable }
 
     public var isCrisis: Bool { (result?.disk.available ?? .max) < 10 * 1_000_000_000 }
     public var isModest: Bool { solidReclaimable < 3 * 1_000_000_000 }
@@ -462,7 +446,7 @@ public final class AppModel {
     public var stripSegments: [(tier: Tier?, bytes: Int64)] {
         guard let result else { return [] }
         var byTier: [Tier: Int64] = [:]
-        for item in items where !item.isStashed {
+        for item in items {
             byTier[item.entry.tier, default: 0] += item.bytes
         }
         let classified = byTier.values.reduce(0, +)
@@ -477,15 +461,9 @@ public final class AppModel {
 
     // MARK: - Lenses
 
-    /// Observable mirror of `result.lensFindings` (class mutation is
-    /// invisible to Observation); finishScan and loadCachedScan sync it,
-    /// prunes write back through syncLensFindings().
-    public var lensFindings: [LensFinding] = [] {
-        didSet { rebuildLensItems() }
-    }
-
-    func syncLensFindings() {
-        result?.lensFindings = lensFindings
+    public var lensFindings: [LensFinding] {
+        get { inventory.result?.lensFindings ?? [] }
+        set { inventory.setFindings(newValue) }
     }
 
     public var lensIdentifiedBytes: Int64 {
@@ -497,6 +475,13 @@ public final class AppModel {
         stripSegments.first { $0.tier == nil }?.bytes ?? 0
     }
 
+    public var remainingStorageExplanation: String {
+        guard let result, result.root.path == "/" else { return Copy.lensDenLine }
+        let balance = StorageBalance(used: result.disk.used, scanned: result.root.allocatedBytes,
+                                     named: items.reduce(0) { $0 + $1.bytes }, outsideWalk: result.outsideWalkBytes)
+        return Copy.remainingStorageBreakdown(ByteFormat.string(balance.readable), ByteFormat.string(balance.unmeasured))
+    }
+
     public func pushSheet(_ next: ActiveSheet) {
         if let current = sheet { sheetStack.append(current) }
         sheet = next
@@ -505,29 +490,29 @@ public final class AppModel {
     public func closeSheet() {
         sheet = sheetStack.popLast()
         if sheet == nil && !lensFindings.isEmpty {
-            // Reclaimed or hand-deleted findings leave the inventory the
-            // moment the window is visible again; no row for something gone.
-            lensFindings.removeAll { !FileManager.default.fileExists(atPath: $0.url.path) }
-            syncLensFindings()
+            let findings = lensFindings
+            let revision = inventory.revision
+            Task {
+                let remaining = await Task.detached(priority: .utility) {
+                    findings.filter { FileManager.default.fileExists(atPath: $0.url.path) }
+                }.value
+                guard revision == inventory.revision, remaining.count != findings.count else { return }
+                inventory.setFindings(remaining)
+            }
         }
     }
 
     /// The Items row for a container engine shows what its tool can clear
     /// right now, not the virtual disk's total: the row and its sheet agree.
     public func refreshDockerBytes() {
-        guard ToolRunner.isAvailable(.docker) else { return }
-        Task { [weak self] in
+        guard let item = items.first(where: { $0.entryID == "docker.data" || $0.entryID == "orbstack.data" }) else { return }
+        let revision = inventory.revision
+        Task {
             guard let out = try? await ToolRunner.run(.docker, ["system", "df", "--format", "{{json .}}"], timeout: 15),
                   out.status == 0 else { return }
-            let clearable = DockerCleanup.dfRows(fromOutput: String(data: out.stdout, encoding: .utf8) ?? "")
+            let bytes = DockerCleanup.dfRows(fromOutput: String(data: out.stdout, encoding: .utf8) ?? "")
                 .values.reduce(0, +)
-            await MainActor.run {
-                guard let self,
-                      let index = self.result?.items.firstIndex(where: { $0.entryID == "docker.data" || $0.entryID == "orbstack.data" })
-                else { return }
-                self.result?.items[index].bytes = clearable
-                self.result = self.result  // class mutation; poke observation
-            }
+            inventory.updateBytes(bytes, itemID: item.id, expectedRevision: revision)
         }
     }
 
@@ -548,10 +533,6 @@ public final class AppModel {
         })
     }
 
-    public func reclaimFinding(_ finding: LensFinding) {
-        reclaimFindings([finding])
-    }
-
     /// A tier band in the Disk Strip drills into Items filtered to that tier;
     /// clicking the active band again clears the filter.
     public func focusLedger(tier: Tier) {
@@ -565,13 +546,27 @@ public final class AppModel {
 
     // MARK: - Tray
 
-    public func canSelect(_ item: AtlasItem) -> Bool {
-        switch item.entry.tier {
-        case .regenerable, .rebuildable: return !item.isStashed
-        case .managed: return false
-        // Yours stays untouchable except lens-named items: each was
-        // individually witnessed, so the tray may take it.
-        case .yours: return item.entryID == "lens.found"
+    public func canSelect(_ item: AtlasItem) -> Bool { ItemAction.canBatch(item) }
+
+    public func action(for item: AtlasItem) -> ItemAction? {
+        ItemAction.resolve(item, tools: toolsAvailable)
+    }
+
+    public func perform(_ action: ItemAction, on item: AtlasItem) {
+        actionTask?.cancel()
+        switch action {
+        case .reclaim: openReclaimPlan(items: [item])
+        case .cleanup: sheet = .cleanup(entryID: item.entryID)
+        case .teach(let flow): sheet = .teach(flow, bytes: item.bytes)
+        case .uninstall: actionTask = Task { await openUninstallPlan(item) }
+        case .trimMessages: actionTask = Task { await openMessagesTrim(bytes: item.bytes) }
+        case .trimPhotos: actionTask = Task { await openPhotosTrim(item) }
+        }
+    }
+
+    public func setTray(items: [AtlasItem], selected: Bool) {
+        for item in items where canSelect(item) && trayItems.contains(item) != selected {
+            toggleTray(item)
         }
     }
 
@@ -581,9 +576,7 @@ public final class AppModel {
             return
         }
         guard canSelect(item) else {
-            if let flow = item.entry.teachFlow {
-                sheet = .teach(flow, bytes: item.bytes)
-            }
+            if let action = action(for: item) { perform(action, on: item) }
             return
         }
         // No confirmation here: checking a box is reversible, and the
@@ -592,15 +585,116 @@ public final class AppModel {
     }
 
     public var trayBytes: Int64 { trayItems.reduce(0) { $0 + $1.bytes } }
-    public var trayAllStashable: Bool { !trayItems.isEmpty && trayItems.allSatisfy { $0.entry.stashable } }
 
     public func clearTray() { trayItems = [] }
 
     // MARK: - Reclaim
 
+    /// A no-op filesystem probe cannot establish App Management permission.
+    /// Open the review first; only the user's confirmed operation tests access.
+    public func openUninstallPlan(_ item: AtlasItem) async {
+        await prepareUninstallPlan(item)
+    }
+
+    /// Offer Settings after a real access failure. Remember only the app to
+    /// review after reopening; never resume destructive work automatically.
+    public func beginAppManagementWait(for item: AtlasItem) {
+        settings.pendingUninstallPath = item.url.path
+        // The sheet closes before Settings opens. A modal sheet makes the
+        // app unquittable, and this flow ends in a quit: with one up, macOS
+        // refuses its own Quit & Reopen with a beep, which is exactly the
+        // remedy the grant needs. The floating panel carries the wait.
+        sheet = nil
+        sheetStack = []
+        AppManagement.openSettings()
+        GrantHelperPanel.shared.show { [weak self] in self?.relaunchApp() }
+        Analytics.shared.log("app_management_settings_opened")
+    }
+
+    /// Backing out: the uninstall is abandoned, so the panel and
+    /// the pending resume all go with it.
+    public func cancelAppManagementWait() {
+        hideAppManagementHelper()
+        settings.pendingUninstallPath = nil
+    }
+
+    /// Teardown that keeps the pending uninstall: the relaunch runs this,
+    /// and the next launch resumes what the sheet started.
+    public func hideAppManagementHelper() {
+        GrantHelperPanel.shared.hide()
+    }
+
+    /// The relaunch dismisses whatever is on screen first: a modal defers
+    /// termination, which is how a relaunch used to leave the old instance
+    /// running beside the new one.
+    func prepareForRelaunch() {
+        hideAppManagementHelper()
+        sheet = nil
+        sheetStack = []
+    }
+
+    /// Resume at review regardless of the old probe's result. A missing app
+    /// is dropped, and the user still has to confirm the new plan.
+    public func resumePendingUninstall() async {
+        guard let path = settings.pendingUninstallPath else { return }
+        settings.pendingUninstallPath = nil
+        let exists = await Task.detached { FileManager.default.fileExists(atPath: path) }.value
+        guard exists, !Task.isCancelled else { return }
+        let item = items.first { $0.entryID == "app.bundle" && $0.url.path == path }
+            ?? AtlasItem(entryID: "app.bundle", url: URL(fileURLWithPath: path),
+                         bytes: 0, lastTouched: nil)
+        await prepareUninstallPlan(item)
+    }
+
+    private func prepareUninstallPlan(_ item: AtlasItem) async {
+        let plan = await ReclaimPlanner.uninstall(item, root: result?.root)
+        guard !Task.isCancelled else { return }
+        if let bundleID = plan.bundleID,
+           NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == bundleID }) {
+            toast = Toast(text: Copy.ineligibleRunning(item.displayName))
+            return
+        }
+        openReclaimPlan(items: plan.items, title: Copy.uninstallTitle(item.displayName))
+    }
+
+    public func openMessagesTrim(bytes: Int64) async {
+        let items = await ReclaimPlanner.messages(root: result?.root)
+        guard !Task.isCancelled else { return }
+        if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == MessagesTrim.messagesBundleID }) {
+            toast = Toast(text: Copy.ineligibleRunning("Messages"))
+            return
+        }
+        guard let items else {
+            toast = Toast(text: Copy.messagesCloudOff)
+            sheet = .teach(.messages, bytes: bytes)
+            return
+        }
+        guard !items.isEmpty else { toast = Toast(text: Copy.kibiDenTidy); return }
+        openReclaimPlan(items: items, title: Copy.messagesTrimTitle)
+    }
+
+    public func openPhotosTrim(_ item: AtlasItem) async {
+        let items = await ReclaimPlanner.photos(item, root: result?.root)
+        guard !Task.isCancelled else { return }
+        if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == PhotosTrim.photosBundleID }) {
+            toast = Toast(text: Copy.ineligibleRunning("Photos"))
+            return
+        }
+        guard !items.isEmpty else { toast = Toast(text: Copy.kibiDenTidy); return }
+        openReclaimPlan(items: items, title: Copy.photosTrimTitle)
+    }
+
     public func openReclaimPlan(items: [AtlasItem]? = nil, title: String = Copy.planTitle) {
         let source = items ?? trayItems
         guard !source.isEmpty else { return }
+        if !reclaiming {
+            // A clean finish closes the sheet without an OK press, so the
+            // last run's outcome may still be here. A fresh plan opens
+            // fresh; only a run still in flight keeps its live view.
+            reclaimOutcome = nil
+            reclaimStatuses = []
+            planKeepInTrash = settings.keepInTrashDefault
+        }
         planItems = source
         planTitle = title
         pushSheet(.reclaimPlan(title: title))
@@ -608,23 +702,13 @@ public final class AppModel {
 
     /// Pre-composed crisis plan: quickest safe items first.
     public func crisisPlan() -> [AtlasItem] {
-        items.filter { $0.entry.tier == .regenerable && !$0.isStashed }
+        items.filter { $0.entry.tier == .regenerable }
             .sorted { $0.bytes > $1.bytes }
     }
 
     public func runReclaim(selected: [AtlasItem]) {
-        let split = ReclaimPlan(items: selected).freeSplit(remainingAllowance: pro.remainingAllowance)
-        let toRun = split.now
-        guard !toRun.isEmpty else {
-            // Boundary reached with nothing free to run: the paywall may show,
-            // unless a recent decline put it on cooldown.
-            if paywallCoolingDown {
-                toast = Toast(text: Copy.paywallBoundary)
-            } else {
-                sheet = .paywall(trigger: "free_boundary")
-            }
-            return
-        }
+        let toRun = selected
+        guard !toRun.isEmpty else { return }
         reclaiming = true
         reclaimStatuses = Array(repeating: .pending, count: toRun.count)
         let keep = planKeepInTrash
@@ -635,7 +719,7 @@ public final class AppModel {
                     if index < self.reclaimStatuses.count { self.reclaimStatuses[index] = status }
                 }
             }
-            self.completeReclaim(outcome: outcome, lockedCount: split.withPro.count)
+            self.completeReclaim(outcome: outcome)
         }
     }
 
@@ -643,19 +727,18 @@ public final class AppModel {
         reclaimTask?.cancel()
     }
 
-    private func completeReclaim(outcome: ReclaimOutcome, lockedCount: Int) {
+    private func completeReclaim(outcome: ReclaimOutcome) {
         reclaiming = false
         reclaimOutcome = outcome
         if let receipt = outcome.receipt {
             receipts.append(receipt)
-            pro.recordReclaim(bytes: outcome.reclaimedBytes)
             changeLog.append(ChangeEvent(
                 text: "Reclaimed \(ByteFormat.string(outcome.reclaimedBytes))",
                 delta: -outcome.reclaimedBytes
             ))
         }
         if outcome.doneCount > 0 {
-            SoundPlayer.shared.play(.pour)
+            SoundPlayer.shared.play(.whoosh)
             toast = Toast(text: Copy.reclaimToast(ByteFormat.string(outcome.reclaimedBytes)))
             removeReclaimedFromModel(outcome: outcome)
         }
@@ -667,146 +750,15 @@ public final class AppModel {
             sheet = nil
             trayItems = []
         }
-        if lockedCount > 0 && !pro.isPro {
-            Analytics.shared.log("free_boundary_hit")
-        }
     }
 
     private func removeReclaimedFromModel(outcome: ReclaimOutcome) {
-        guard let result, let receipt = outcome.receipt else { return }
+        guard let receipt = outcome.receipt else { return }
         let gone = Set(receipt.items.map(\.path))
-        result.items.removeAll { gone.contains($0.url.path) }
+        inventory.remove(paths: gone)
         planItems.removeAll { gone.contains($0.url.path) }
         trayItems.removeAll { gone.contains($0.url.path) }
-        pruneNodes(paths: gone, under: result.root)
-    }
-
-    private func pruneNodes(paths: Set<String>, under node: ScanNode) {
-        var removedBytes: Int64 = 0
-        node.children.removeAll { child in
-            if paths.contains(child.path) {
-                removedBytes += child.allocatedBytes
-                return true
-            }
-            return false
-        }
-        for child in node.children {
-            if paths.contains(where: { $0.hasPrefix(child.path + "/") }) {
-                pruneNodes(paths: paths, under: child)
-            }
-        }
-        if removedBytes > 0 {
-            var current: ScanNode? = node
-            while let n = current {
-                n.allocatedBytes -= removedBytes
-                current = n.parent
-            }
-        }
-    }
-
-    // MARK: - Stash
-
-    private func restoreStashIfKnown() {
-        guard let path = UserDefaults.standard.string(forKey: "stashVolumePath") else { return }
-        let url = URL(fileURLWithPath: path)
-        // All volume IO stays off the main thread: a stalled drive holds
-        // open() indefinitely and would brick launch before the first window.
-        // The fileExists guard also keeps StashManager.init from creating a
-        // phantom /Volumes folder on the internal disk when the drive is away.
-        Task.detached(priority: .utility) { [weak self] in
-            let manager: StashManager? = FileManager.default.fileExists(atPath: path)
-                ? (try? StashManager(volume: url)) : nil
-            await MainActor.run {
-                guard let self, let manager else { return }
-                self.stash = manager
-                self.guardian.refresh()
-            }
-        }
-        guardian.refresh()
-    }
-
-    public func adoptStash(volume: URL) throws {
-        let manager = try StashManager(volume: volume)
-        UserDefaults.standard.set(volume.path, forKey: "stashVolumePath")
-        stash = manager
-        guardian.refresh()
-    }
-
-    public func stashItem(_ item: AtlasItem) {
-        stashItems([item])
-    }
-
-    /// Moves run one at a time: the manifest is a single journal, so a
-    /// group toggle must not start concurrent transactions.
-    public func stashItems(_ items: [AtlasItem]) {
-        let movable = items.filter { !$0.isStashed }
-        guard !movable.isEmpty else { return }
-        guard pro.isPro else {
-            sheet = .paywall(trigger: "stash_toggle")
-            return
-        }
-        guard stash != nil else {
-            sheet = .stashSetup
-            return
-        }
-        for item in movable { stashBusy.insert(item.id) }
-        Task {
-            for item in movable {
-                await self.performStash(item)
-            }
-        }
-    }
-
-    private func performStash(_ item: AtlasItem) async {
-        guard let stash else {
-            stashBusy.remove(item.id)
-            return
-        }
-        do {
-            try await stash.stash(item: item, fullHash: settings.fullHashVerify)
-            stashBusy.remove(item.id)
-            markStashDone(item: item)
-            SoundPlayer.shared.play(.tuck)
-            toast = Toast(text: Copy.moveDoneToast(ByteFormat.string(item.bytes)))
-            changeLog.append(ChangeEvent(
-                text: "Moved \(item.displayName) to the Stash",
-                delta: -item.bytes
-            ))
-            Analytics.shared.log("stash_move", ["bytes": String(item.bytes), "direction": "out", "result": "ok"])
-        } catch {
-            stashBusy.remove(item.id)
-            self.stash?.lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            toast = Toast(text: self.stash?.lastError ?? Copy.moveFail)
-            Analytics.shared.log("stash_move", ["direction": "out", "result": "fail"])
-        }
-    }
-
-    public func bringHome(entryID: UUID) {
-        bringHomeEntries([entryID])
-    }
-
-    public func bringHomeEntries(_ ids: [UUID]) {
-        guard let stash else { return }
-        Task {
-            var anySucceeded = false
-            for id in ids {
-                do {
-                    try await stash.bringHome(id, fullHash: settings.fullHashVerify)
-                    anySucceeded = true
-                } catch {
-                    self.toast = Toast(text: (error as? LocalizedError)?.errorDescription ?? Copy.moveFail)
-                }
-            }
-            if anySucceeded { self.rescanSoon() }
-        }
-    }
-
-    private func markStashDone(item: AtlasItem) {
-        guard let result else { return }
-        if let i = result.items.firstIndex(where: { $0.id == item.id }) {
-            result.items[i].isStashed = true
-        }
-        trayItems.removeAll { $0.id == item.id }
+        zoomPath = zoomPath.compactMap { result?.root.find(path: $0.path) }
     }
 
     public func rescanSoon() {
@@ -817,17 +769,22 @@ public final class AppModel {
     /// Restore the last scan from disk. Relaunches land here; the volume is
     /// walked again only on the refresh button or when the watcher sees real
     /// changes settle.
-    public func loadCachedScan() -> Bool {
-        guard result == nil, !scanning else { return false }
+    public func loadCachedScan() async -> Bool {
+        guard result == nil, !scanning else { return result != nil }
         guard let root = scanRoot ?? restoreGrant() else { return false }
         scanRoot = root
-        guard let cached = ScanCache.load(rootPath: root.standardizedFileURL.path) else { return false }
-        cached.disk = DiskSnapshot.capture()
-        markStashedItems(in: cached)
+        let revision = inventory.revision
+        let generation = scanGeneration
+        let cacheURL = scanCacheURL
+        let cached = await Task.detached(priority: .userInitiated) { () -> ScanResult? in
+            guard var cached = ScanCache.load(rootPath: root.standardizedFileURL.path, from: cacheURL) else { return nil }
+            cached.disk = DiskSnapshot.captureSpace(snapshotCount: cached.disk.snapshotCount)
+            cached.lensFindings.removeAll { !FileManager.default.fileExists(atPath: $0.url.path) }
+            return cached
+        }.value
+        guard !Task.isCancelled, !scanning, generation == scanGeneration, revision == inventory.revision, scanRoot == root else { return result != nil }
+        guard let cached else { return false }
         result = cached
-        // Findings restored with the cache like every other item;
-        // prune what vanished since.
-        lensFindings = cached.lensFindings.filter { FileManager.default.fileExists(atPath: $0.url.path) }
         startWatching()
         refreshDockerBytes()
         return true
@@ -878,7 +835,7 @@ public final class AppModel {
     // MARK: - Update planner
 
     public func composeUpdatePlan(neededBytes: Int64) {
-        updatePlan = UpdatePlanner.compose(need: neededBytes, items: items, hasStash: stash != nil)
+        updatePlan = UpdatePlanner.compose(need: neededBytes, items: items)
         sheet = .updatePlanner
     }
 
@@ -887,8 +844,11 @@ public final class AppModel {
     public struct Suggestion: Identifiable {
         public let id: String
         public let item: AtlasItem?
-        public let verb: String   // Reclaim / Stash / Show me
+        public let action: ItemAction
         public let line: String
+        public var members: [AtlasItem] = []
+        public var title: String { members.isEmpty ? (item?.displayName ?? "") : StorageGroup.forItem(members[0]).title }
+        public var bytes: Int64 { members.isEmpty ? (item?.bytes ?? 0) : members.reduce(0) { $0 + $1.bytes } }
     }
 
     /// (evolved): the briefing lists every recommended move, named and
@@ -909,30 +869,27 @@ public final class AppModel {
     }
 
     private var suggestionCandidates: [Suggestion] {
-        let staleCutoff = Date().addingTimeInterval(-30 * 86_400)
-        var out: [Suggestion] = []
-        for item in items where !item.isStashed && item.bytes > 1_000_000_000 {
-            switch item.entry.tier {
-            case .regenerable:
-                out.append(Suggestion(id: item.id, item: item, verb: Copy.trayReclaim, line: item.entry.identityLine))
-            case .rebuildable:
-                if (item.lastTouched ?? .distantPast) < staleCutoff {
-                    let verb = item.entry.stashable && stash != nil ? Copy.trayStash : Copy.trayReclaim
-                    out.append(Suggestion(id: item.id, item: item, verb: verb, line: item.entry.identityLine))
-                }
-            case .managed:
-                if let tool = ToolCleanup.tool(for: item.entryID), toolsAvailable.contains(tool) {
-                    out.append(Suggestion(id: item.id, item: item, verb: Copy.cleanUp, line: item.entry.identityLine))
-                } else if ToolCleanup.directReclaimEntryIDs.contains(item.entryID) {
-                    out.append(Suggestion(id: item.id, item: item, verb: Copy.trayReclaim, line: item.entry.identityLine))
-                } else if item.entry.teachFlow != nil {
-                    out.append(Suggestion(id: item.id, item: item, verb: Copy.showMe, line: item.entry.identityLine))
-                }
-            case .yours:
-                continue
-            }
+        let cutoff = Date().addingTimeInterval(-30 * 86_400)
+        let reproducible = items.filter {
+            guard !$0.entry.planDefaultOff else { return false }
+            return $0.entry.tier == .regenerable ||
+                ($0.entry.tier == .rebuildable && ($0.lastTouched ?? .distantPast) < cutoff)
         }
-        return out.sorted { ($0.item?.bytes ?? 0) > ($1.item?.bytes ?? 0) }
+        var out = Dictionary(grouping: reproducible, by: StorageGroup.forItem).compactMap { kind, members -> Suggestion? in
+            guard members.reduce(Int64(0), { $0 + $1.bytes }) >= 100_000_000 else { return nil }
+            let sorted = members.sorted { $0.bytes == $1.bytes ? $0.id < $1.id : $0.bytes > $1.bytes }
+            return Suggestion(id: "group." + kind.rawValue, item: sorted.first, action: .reclaim,
+                              line: kind == .builds ? Copy.groupOlderBuilds : kind.explanation, members: sorted)
+        }
+        out += items.compactMap { item in
+            guard item.entry.tier != .regenerable && item.entry.tier != .rebuildable,
+                  let action = ItemAction.suggestion(item, tools: toolsAvailable) else { return nil }
+            return Suggestion(id: item.id, item: item, action: action, line: item.entry.identityLine)
+        }
+        return out.sorted {
+            if $0.members.isEmpty != $1.members.isEmpty { return !$0.members.isEmpty }
+            return $0.bytes == $1.bytes ? $0.id < $1.id : $0.bytes > $1.bytes
+        }
     }
 
     public func dismissSuggestion(_ id: String) {
@@ -953,118 +910,8 @@ public final class AppModel {
         }
     }
 
-    /// Ask the tool what can go; every row carries the exact argv it would run.
     public func composeCleanupPlan(entryID: String) async -> CleanupPlan {
-        guard let tool = ToolCleanup.tool(for: entryID) else {
-            return CleanupPlan(tool: .simctl, entryID: entryID, actions: [], blockedReason: Copy.toolMissing)
-        }
-        func blocked(_ reason: String) -> CleanupPlan {
-            CleanupPlan(tool: tool, entryID: entryID, actions: [], blockedReason: reason)
-        }
-        do {
-            switch tool {
-            case .simctl:
-                let runtimes = try await ToolRunner.run(.simctl, ["simctl", "runtime", "list", "-j"], timeout: 30)
-                guard runtimes.status == 0 else { return blocked(Copy.toolMissing) }
-                // A connected offload drive turns current runtimes into
-                // copy-then-delete rows and surfaces images already resting
-                // there as add-back rows.
-                var offloadDir: String?
-                var driveName: String?
-                if let stash, stash.volumeIsPresent {
-                    offloadDir = stash.stashRoot.appendingPathComponent("Runtimes", isDirectory: true).path
-                    driveName = stash.volumeName
-                }
-                var (actions, kept) = SimCleanup.runtimePlan(
-                    runtimes: SimctlParser.runtimes(fromJSON: runtimes.stdout),
-                    offloadDir: offloadDir,
-                    driveName: driveName
-                )
-                if let offloadDir, let driveName {
-                    let resting = ((try? FileManager.default.contentsOfDirectory(atPath: offloadDir)) ?? [])
-                        .filter { $0.hasSuffix(".dmg") }
-                        .map { offloadDir + "/" + $0 }
-                    actions += SimCleanup.addBackActions(imagePaths: resting, driveName: driveName)
-                }
-                // The row's total also holds the dyld caches; offer them too
-                // so the sheet reconciles and everything is deletable.
-                let dyldBytes = SimCleanup.directorySize("/Library/Developer/CoreSimulator/Caches/dyld")
-                if dyldBytes > 100_000_000 {
-                    actions.append(SimCleanup.dyldCacheRow(bytes: dyldBytes))
-                }
-                var notes = kept.map { runtime in
-                    Copy.cleanupStays(
-                        "\(SimCleanup.shortPlatform(runtime.identifier)) \(runtime.version)",
-                        ByteFormat.string(runtime.sizeBytes ?? 0)
-                    )
-                }
-                // One Simulator sheet: devices and test clones join
-                // the runtime rows.
-                let devices = try await ToolRunner.run(.simctl, ["simctl", "list", "devices", "-j"], timeout: 30)
-                guard devices.status == 0 else { return blocked(Copy.toolMissing) }
-                var (deviceActions, keptCount) = SimCleanup.devicePlan(
-                    devices: SimctlParser.devices(fromJSON: devices.stdout),
-                    staleCutoff: Date().addingTimeInterval(-90 * 86_400)
-                )
-                // Parallel-testing clones ride this same sheet; the
-                // scan already measured them.
-                let cloneBytes = SimCleanup.directorySize(NSHomeDirectory() + "/Library/Developer/XCTestDevices")
-                if cloneBytes > 0 {
-                    deviceActions.insert(SimCleanup.testCloneRow(bytes: cloneBytes), at: 0)
-                }
-                if keptCount > 0 { notes.append(Copy.cleanupKeptDevices(keptCount)) }
-                return CleanupPlan(tool: .simctl, entryID: entryID, actions: actions + deviceActions, notes: notes)
-            case .docker:
-                let df = try await ToolRunner.run(.docker, ["system", "df", "--format", "{{json .}}"], timeout: 15)
-                guard df.status == 0 else { return blocked(Copy.containerAppStart) }
-                let rows = DockerCleanup.dfRows(fromOutput: String(data: df.stdout, encoding: .utf8) ?? "")
-                // The verbose listing names each unused volume; without it the
-                // plan falls back to one summary prune row.
-                var volumes: [(name: String, bytes: Int64)] = []
-                if rows["Local Volumes", default: 0] > 0,
-                   let verbose = try? await ToolRunner.run(.docker, ["system", "df", "-v", "--format", "{{json .}}"], timeout: 30),
-                   verbose.status == 0 {
-                    volumes = DockerCleanup.volumeRows(
-                        fromVerboseOutput: String(data: verbose.stdout, encoding: .utf8) ?? ""
-                    )
-                }
-                // Reconciliation: the Items row measures the VM disk
-                // file; these rows free space inside it. Say so.
-                return CleanupPlan(tool: .docker, entryID: entryID,
-                                   actions: DockerCleanup.plan(dfRows: rows, volumes: volumes))
-            case .brew:
-                let preview = try await ToolRunner.run(.brew, ["cleanup", "-n", "--prune=all"], timeout: 60)
-                let text = String(data: preview.stdout, encoding: .utf8) ?? ""
-                return CleanupPlan(tool: .brew, entryID: entryID, actions: BrewCleanup.plan(previewOutput: text))
-            case .tmutil:
-                // Deleting the reference snapshot mid-backup is the one
-                // moment to refuse; everything else is the user's call.
-                let status = try await ToolRunner.run(.tmutil, ["status"], timeout: 15)
-                if TMSnapshotParser.backupRunning(fromOutput: String(data: status.stdout, encoding: .utf8) ?? "") {
-                    return blocked(Copy.tmBackupRunning)
-                }
-                let list = try await ToolRunner.run(.tmutil, ["listlocalsnapshots", "/"], timeout: 15)
-                guard list.status == 0 else { return blocked(Copy.toolMissing) }
-                let listText = String(data: list.stdout, encoding: .utf8) ?? ""
-                let tokens = TMSnapshotParser.snapshotTokens(fromOutput: listText)
-                // No destination configured is an answer, not a failure: the
-                // notes then warn instead of reassure.
-                let dest = try? await ToolRunner.run(.tmutil, ["destinationinfo"], timeout: 15)
-                let destination = dest.flatMap {
-                    TMSnapshotParser.destination(fromOutput: String(data: $0.stdout, encoding: .utf8) ?? "")
-                }
-                let (actions, notes, estimate) = TMSnapshotCleanup.plan(
-                    tokens: tokens,
-                    destination: destination,
-                    purgeableBytes: DiskSnapshot.capture().purgeable,
-                    osUpdateCount: TMSnapshotParser.osUpdateCount(fromOutput: listText)
-                )
-                return CleanupPlan(tool: .tmutil, entryID: entryID, actions: actions,
-                                   notes: notes, estimatedBytes: estimate)
-            }
-        } catch {
-            return blocked((error as? LocalizedError)?.errorDescription ?? Copy.toolMissing)
-        }
+        await CleanupPlanner.compose(entryID: entryID)
     }
 
     /// Evolved: the standing trim. macOS has no off switch for local
@@ -1103,13 +950,9 @@ public final class AppModel {
         // Snapshot rows carry no per-row size, so the freed space is measured
         // as a free-space delta around the whole run (: measured, never
         // promised).
-        let diskBefore = plan.tool == .tmutil ? DiskSnapshot.capture() : nil
+        let diskBefore = plan.tool == .tmutil ? await Task.detached { DiskSnapshot.captureSpace() }.value : nil
         for action in plan.checkedActions {
             do {
-                // The copy must land verified before anything is destroyed.
-                if let copy = action.preCopy {
-                    try await ToolRunner.copyFileVerified(from: copy.from, to: copy.to)
-                }
                 let out = try await ToolRunner.run(plan.tool, action.argv, timeout: 600)
                 if out.status == 0 {
                     doneItems.append(ReceiptItem(
@@ -1128,7 +971,7 @@ public final class AppModel {
         if !doneItems.isEmpty {
             var measured: Int64?
             if let diskBefore {
-                let after = DiskSnapshot.capture()
+                let after = await Task.detached { DiskSnapshot.captureSpace() }.value
                 measured = max(0, after.available - diskBefore.available)
                 changeLog.append(ChangeEvent(
                     text: Copy.tmChangeLine(doneItems.count), delta: -(measured ?? 0)
@@ -1137,7 +980,7 @@ public final class AppModel {
             receipts.append(Receipt(items: doneItems, restoreStatus: .deletedNow,
                                     trashFolder: nil, measuredBytes: measured))
             let total = doneItems.reduce(Int64(0)) { $0 + $1.bytes } + (measured ?? 0)
-            SoundPlayer.shared.play(.pour)
+            SoundPlayer.shared.play(.whoosh)
             toast = Toast(text: Copy.reclaimToast(ByteFormat.string(total)))
             Analytics.shared.log("tool_cleanup", [
                 "tool": plan.tool.rawValue, "bytes": String(total), "actions": String(doneItems.count),

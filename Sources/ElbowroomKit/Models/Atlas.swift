@@ -4,7 +4,7 @@ import Foundation
 /// owner, tier, cost to recreate, and actions.
 
 public enum PackID: String, Codable, CaseIterable, Sendable {
-    case xcode, javascript, rust, homebrew, containers, systemResidue, ml
+    case xcode, javascript, rust, homebrew, containers, systemResidue, ml, applications
 }
 
 public enum TeachFlowID: String, Codable, Sendable, CaseIterable {
@@ -12,6 +12,11 @@ public enum TeachFlowID: String, Codable, Sendable, CaseIterable {
     case docker
     case orbstack
     case snapshots
+    case softwareUpdate
+    case messages
+    case mail
+    case photos
+    case sharedWithYou
     case purgeable
     case deviceBackups
     case trash
@@ -43,17 +48,18 @@ public struct AtlasEntry: Identifiable, Sendable {
     public var identityLine: String { Loc.t(identityKey) }
     public let owner: String
     public let tier: Tier
-    /// Appears in the Stash catalog.
-    public let stashable: Bool
     public let teachFlow: TeachFlowID?
     public let cost: CostPolicy
+    /// Never pre-checked in a reclaim plan; the user ticks it by hand.
+    public let planDefaultOff: Bool
     /// Ticker template used during the first scan.
     public let ticker: (@Sendable (String) -> String)?
 
     public init(
         id: String, pack: PackID, title: String, identityLine: String, owner: String,
-        tier: Tier, stashable: Bool = false, teachFlow: TeachFlowID? = nil,
-        cost: CostPolicy = .refills, ticker: (@Sendable (String) -> String)? = nil
+        tier: Tier, teachFlow: TeachFlowID? = nil,
+        cost: CostPolicy = .refills, planDefaultOff: Bool = false,
+        ticker: (@Sendable (String) -> String)? = nil
     ) {
         self.id = id
         self.pack = pack
@@ -61,15 +67,15 @@ public struct AtlasEntry: Identifiable, Sendable {
         self.identityKey = identityLine
         self.owner = owner
         self.tier = tier
-        self.stashable = stashable
         self.teachFlow = teachFlow
         self.cost = cost
+        self.planDefaultOff = planDefaultOff
         self.ticker = ticker
     }
 }
 
 /// A concrete found instance of an Atlas entry: an entry plus a place and a size.
-public struct AtlasItem: Identifiable, Hashable {
+public struct AtlasItem: Identifiable, Hashable, Sendable {
     public let id: String // path
     public let entryID: String
     public let url: URL
@@ -77,7 +83,6 @@ public struct AtlasItem: Identifiable, Hashable {
     public var lastTouched: Date?
     /// Project (repo) name for rebuildables grouped under a repo root.
     public var projectName: String?
-    public var isStashed = false
 
     public init(entryID: String, url: URL, bytes: Int64, lastTouched: Date?, projectName: String? = nil) {
         self.id = url.path
@@ -93,6 +98,13 @@ public struct AtlasItem: Identifiable, Hashable {
     /// Display name: "acme-web · target" for project-grouped items, the app's
     /// own name for generic caches ("Docker cache"), else the entry title.
     public var displayName: String {
+        // Apps wear their own name; residue wears "App · Location".
+        if entryID == "app.bundle" { return projectName ?? url.deletingPathExtension().lastPathComponent }
+        if entryID == "storage.appCache" { return Copy.appCacheTitle(projectName ?? url.lastPathComponent) }
+        if entryID == "app.residue" {
+            let location = url.deletingLastPathComponent().lastPathComponent
+            return "\(projectName ?? url.lastPathComponent) · \(location)"
+        }
         if let projectName { return "\(projectName) · \(url.lastPathComponent)" }
         if entryID == "sys.appCache" {
             return Copy.appCacheTitle(AppNames.human(fromCacheFolder: url.lastPathComponent))

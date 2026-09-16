@@ -1,16 +1,15 @@
 import Foundation
 import os
 
-/// Scan engine, fast path. Same walk semantics as the serial FileManager
-/// walk (kept for A/B under ELBOWROOM_SCAN_LEGACY=1), but:
+/// Parallel scan engine:
 ///
 ///  - directories are read with `getattrlistbulk(2)`: name, type, mtime and
 ///    sizes for hundreds of entries per syscall, no URL/NSURL churn;
 ///  - independent subtrees walk in parallel on a small worker pool (APFS on
 ///    SSD serves concurrent readers well; metadata stays hot in the kernel).
 ///
-/// No caching, no sampling, no skipped bytes: every scan is a full, honest
-/// walk — the speed comes from doing the same reads with less overhead.
+/// Every readable directory in scope is measured without sampling. Protected
+/// locations remain reported as denials; sibling volumes are measured separately.
 
 // MARK: - Bulk directory reading
 
@@ -45,7 +44,7 @@ public enum BulkDir {
 
     /// Read a directory in bulk. `buffer` is a reusable ≥ bufferSize scratch
     /// area owned by the calling worker. Entries with per-entry errors are
-    /// skipped, matching the legacy walk's `try? resourceValues` skip.
+    /// skipped when their metadata cannot be read.
     public static func read(path: String, buffer: UnsafeMutableRawBufferPointer,
                      into entries: inout [BulkEntry]) throws {
         let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
@@ -141,7 +140,7 @@ public enum BulkDir {
     }
 
     /// Fallback for filesystems without bulk support: same entries via
-    /// FileManager, same resource keys as the legacy walk.
+    /// FileManager. Avoid FileProvider keys, which add expensive per-file lookups.
     public static func readViaFileManager(path: String, into entries: inout [BulkEntry]) throws {
         let keys: [URLResourceKey] = [
             .isDirectoryKey, .isSymbolicLinkKey,
@@ -171,7 +170,7 @@ public enum BulkDir {
 /// One in-flight directory. Owned exclusively by the worker enumerating it;
 /// parents are touched only under their own lock via `finalizeIntoParent`.
 private final class DirTask {
-    let node: ScanNode
+    let node: ScanNodeBuilder
     let depth: Int
     let colonyEntry: String?
     let lensEligible: Bool
@@ -186,7 +185,7 @@ private final class DirTask {
     var childrenMax: Date?   // max lastTouched over finalized children
     var fileMax: Date?       // max mtime over direct files (set pre-finalize)
 
-    init(node: ScanNode, depth: Int, colonyEntry: String?, lensEligible: Bool,
+    init(node: ScanNodeBuilder, depth: Int, colonyEntry: String?, lensEligible: Bool,
          repo: ParallelScanJob.RepoBox?, parent: DirTask?) {
         self.node = node
         self.depth = depth
@@ -204,10 +203,10 @@ final class ParallelScanJob: @unchecked Sendable {
         let name: String
         let path: String
         let marker: String
-        let node: ScanNode
+        let node: ScanNodeBuilder
         let lock = OSAllocatedUnfairLock()
         var maxSourceMTime: Date?
-        init(name: String, path: String, marker: String, node: ScanNode) {
+        init(name: String, path: String, marker: String, node: ScanNodeBuilder) {
             self.name = name
             self.path = path
             self.marker = marker
@@ -263,11 +262,11 @@ final class ParallelScanJob: @unchecked Sendable {
         // (measured: 6 workers 2.8s over a warm 1.3M-entry home, 8 workers
         // 5.3s, 12 workers 6.6s). More is not better here.
         let env = ProcessInfo.processInfo.environment["ELBOWROOM_SCAN_WORKERS"].flatMap(Int.init)
-        self.workerCount = env ?? max(2, min(6, ProcessInfo.processInfo.activeProcessorCount))
+        self.workerCount = max(1, min(6, env ?? ProcessInfo.processInfo.activeProcessorCount))
     }
 
     func start() {
-        let rootNode = ScanNode(url: rootURL, isDirectory: true, parent: nil)
+        let rootNode = ScanNodeBuilder(url: rootURL, isDirectory: true, parent: nil)
         let task = DirTask(
             node: rootNode, depth: 0, colonyEntry: nil,
             lensEligible: rootURL.path == homePath, repo: nil, parent: nil
@@ -338,7 +337,7 @@ final class ParallelScanJob: @unchecked Sendable {
         if last { complete(cancelled: wasCancelled) }
     }
 
-    // MARK: Directory processing (mirrors ScanEngine.walk case by case)
+    // MARK: Directory processing
 
     private func process(_ task: DirTask, buffer: UnsafeMutableRawBufferPointer) {
         let node = task.node
@@ -368,9 +367,17 @@ final class ParallelScanJob: @unchecked Sendable {
             return
         }
 
+        var colonyEntry = task.colonyEntry
+        if colonyEntry == nil, let identity = StorageRecognition.structuralIdentity(
+            names: Set(entries.map(\.name)), path: path, home: homePath
+        ) {
+            node.atlasEntryID = identity
+            colonyEntry = identity
+        }
+
         // Repo marker from the listing already in hand — no extra stat.
         var repo = task.repo
-        if task.depth > 0, task.colonyEntry == nil,
+        if task.depth > 0, colonyEntry == nil,
            let marker = ScanEngine.projectMarker(names: entries.lazy.map(\.name)) {
             let box = RepoBox(name: node.name, path: path, marker: marker, node: node)
             stateLock.lock()
@@ -395,7 +402,7 @@ final class ParallelScanJob: @unchecked Sendable {
             if task.depth == 0 {
                 if path == "/" && entry.name.hasPrefix(".") { continue }
             }
-            if ScanEngine.rootSkips.contains(childPath) { continue }
+            if ScanEngine.shouldSkip(path: childPath) { continue }
             lastPath = childPath
 
             if entry.isSymlink {
@@ -405,8 +412,8 @@ final class ParallelScanJob: @unchecked Sendable {
             }
 
             if entry.isDirectory {
-                let childNode = ScanNode(path: childPath, isDirectory: true, parent: node)
-                var childColony = task.colonyEntry
+                let childNode = ScanNodeBuilder(path: childPath, isDirectory: true, parent: node)
+                var childColony = colonyEntry
                 if childColony == nil {
                     if siblingNames == nil, Atlas.needsSiblings(entry.name) {
                         siblingNames = Set(entries.lazy.map(\.name))
@@ -436,12 +443,9 @@ final class ParallelScanJob: @unchecked Sendable {
                 task.lock.lock()
                 task.pending += 1
                 task.lock.unlock()
-                if task.depth < ScanEngine.maxDepth {
-                    push(childTask)
-                } else {
-                    // Beyond max depth the child exists but is not entered.
-                    finalizeSelf(childTask)
-                }
+                // Directory symlinks are excluded above. Deep dependency trees
+                // still occupy space and must not disappear at an arbitrary depth.
+                push(childTask)
             } else {
                 let logical = entry.logical
                 let allocated = entry.allocated
@@ -456,7 +460,7 @@ final class ParallelScanJob: @unchecked Sendable {
                 directBytes += allocated
                 localBytes += allocated
                 localScanned += 1
-                if task.lensEligible, task.colonyEntry == nil, allocated >= 262_144 {
+                if task.lensEligible, colonyEntry == nil, allocated >= 262_144 {
                     localFacts.append(FileFact(
                         path: childPath, bytes: allocated,
                         modified: entry.mtime ?? .distantPast, isDirectory: false
@@ -465,7 +469,7 @@ final class ParallelScanJob: @unchecked Sendable {
                 if let mt = entry.mtime {
                     if task.fileMax == nil || mt > task.fileMax! { task.fileMax = mt }
                     // Source files update repo staleness; artifact colonies don't.
-                    if let repo, task.colonyEntry == nil { repo.bump(mt) }
+                    if let repo, colonyEntry == nil { repo.bump(mt) }
                 }
             }
 
@@ -534,7 +538,7 @@ final class ParallelScanJob: @unchecked Sendable {
         var task: DirTask? = start
         while let t = task {
             t.node.lastTouched = maxDate(t.fileMax, t.childrenMax)
-            guard let parent = t.parent else { rootSealed(); return }
+            guard let parent = t.parent else { return }
 
             let node = t.node
             parent.lock.lock()
@@ -544,8 +548,15 @@ final class ParallelScanJob: @unchecked Sendable {
                     parent.childrenMax = ct
                 }
             }
+            let hasIdentity = node.atlasEntryID != nil || node.containsClassifiedStorage
+            if hasIdentity { parent.node.containsClassifiedStorage = true }
+            // Retain ownership markers through small ancestors; otherwise a
+            // later parent grouping could count their already-named bytes again.
+            let cacheRoot = homePath + "/Library/Caches"
+            let cacheAncestor = node.path == cacheRoot || cacheRoot.hasPrefix(node.path + "/")
             // Prune: small children collapse into the pebble pile.
-            if node.allocatedBytes >= ScanEngine.keepThreshold || parent.depth < 1 || node.atlasEntryID != nil {
+            if node.allocatedBytes >= ScanEngine.keepThreshold || parent.depth < 1 || hasIdentity
+                || cacheAncestor || parent.node.path == cacheRoot {
                 parent.node.children.append(node)
             } else {
                 parent.node.collapsedCount += 1 + node.collapsedCount + node.children.count
@@ -566,7 +577,7 @@ final class ParallelScanJob: @unchecked Sendable {
 
             if let entryID = node.atlasEntryID {
                 let repo = parent === rootTask ? nil : effectiveRepo(of: parent)
-                var item = AtlasItem(
+                let item = AtlasItem(
                     entryID: entryID, url: node.url, bytes: node.allocatedBytes,
                     lastTouched: node.lastTouched, projectName: repo?.name
                 )
@@ -574,7 +585,7 @@ final class ParallelScanJob: @unchecked Sendable {
                 stateLock.lock()
                 if let repo { itemRepo[item.id] = repo.path }
                 items.append(item)
-                let ticker = tickerLine(for: &item)
+                let ticker = tickerLine(for: item)
                 stateLock.unlock()
                 if let ticker { continuation.yield(.ticker(ticker)) }
             }
@@ -598,7 +609,7 @@ final class ParallelScanJob: @unchecked Sendable {
     }
 
     /// Must be called with stateLock held.
-    private func tickerLine(for item: inout AtlasItem) -> String? {
+    private func tickerLine(for item: AtlasItem) -> String? {
         guard item.bytes >= 500 * 1_000_000,
               !tickeredEntries.contains(item.entryID),
               let template = item.entry.ticker
@@ -616,9 +627,7 @@ final class ParallelScanJob: @unchecked Sendable {
         }
     }
 
-    private func rootSealed() {}
-
-    // MARK: Completion (matches the legacy scan()'s post-passes exactly)
+    // MARK: Completion
 
     private func complete(cancelled: Bool) {
         queueCond.lock()
@@ -658,12 +667,18 @@ final class ParallelScanJob: @unchecked Sendable {
                 finalItems[i].lastTouched = stale
             }
         }
+        // Apps claim their residue nodes first, so the generic cache pass
+        // never re-counts a claimed folder.
+        finalItems.append(contentsOf: AppsPass.items(root: rootNode, homePath: homePath))
         finalItems.append(contentsOf: ScanEngine.genericCacheItems(
             homePath: homePath, root: rootNode, known: finalItems
         ))
         finalItems.append(contentsOf: ScanEngine.brewOldVersionItems(root: rootNode))
+        finalItems.append(contentsOf: StorageRecognition.items(root: rootNode, home: homePath, known: finalItems))
         phase("cache+brew items")
+        let beforeRuntimeBytes = finalItems.reduce(Int64(0)) { $0 + $1.bytes }
         ScanEngine.addRuntimeAssetBytes(to: &finalItems)
+        var outsideWalkBytes = max(0, finalItems.reduce(Int64(0)) { $0 + $1.bytes } - beforeRuntimeBytes)
         phase("runtimeAssets")
         ScanEngine.mergeSimulatorItems(&finalItems, homePath: homePath)
         let disk = DiskSnapshot.capture()
@@ -671,11 +686,15 @@ final class ParallelScanJob: @unchecked Sendable {
         // Snapshots ride the items list like everything else; the
         // insight remains only for snapshot-free purgeable space.
         let (snapshotItem, insights) = TMSnapshotCleanup.scanArtifacts(disk: disk)
-        if let snapshotItem { finalItems.append(snapshotItem) }
+        if let snapshotItem { finalItems.append(snapshotItem); outsideWalkBytes += snapshotItem.bytes }
+        // The container's sibling volumes (OS, update staging, swap) become
+        // System items: named, never gray.
+        let volumeItems = SystemSpace.items(container: ContainerInfo.capture())
+        finalItems.append(contentsOf: volumeItems)
+        outsideWalkBytes += volumeItems.reduce(0) { $0 + $1.bytes }
         finalItems.sort {
             $0.bytes != $1.bytes ? $0.bytes > $1.bytes : $0.id < $1.id
         }
-        let classified = finalItems.reduce(Int64(0)) { $0 + $1.bytes }
         let seeds = repos.values.map {
             Lens.ProjectSeed(path: $0.path, marker: $0.marker,
                              bytes: $0.node.allocatedBytes,
@@ -686,16 +705,26 @@ final class ParallelScanJob: @unchecked Sendable {
             facts: facts, homePath: homePath, root: rootNode,
             projects: seeds, classified: finalItems.map { ($0.id, $0.bytes) }
         )
+        let media = StorageRecognition.mediaItems(root: rootNode, facts: facts, home: homePath,
+            excluding: finalItems.map(\.id) + findings.filter { $0.kind != .stratum }.map { $0.url.path })
+        finalItems += media
+        finalItems.append(contentsOf: StorageRecognition.personalItems(
+            root: rootNode, home: homePath, projects: Array(repos.keys),
+            findings: findings.filter { $0.kind != .stratum }.map { ($0.url.path, $0.bytes) } + media.map { ($0.id, $0.bytes) }
+        ))
+        finalItems.removeAll { $0.bytes <= 0 }
+        finalItems.sort { $0.bytes != $1.bytes ? $0.bytes > $1.bytes : $0.id < $1.id }
+        let classified = finalItems.reduce(Int64(0)) { $0 + $1.bytes }
         phase("lensFindings")
         let result = ScanResult(
-            root: rootNode, items: finalItems,
+            root: rootNode.snapshot(), items: finalItems,
             repoStaleness: repos.mapValues { $0.maxSourceMTime ?? Date.distantPast },
             deniedPaths: denied, disk: disk,
             duration: Date().timeIntervalSince(started),
             insights: insights,
             scannedBytes: bytesSeen,
             classifiedBytes: min(classified, bytesSeen),
-            lensFindings: findings
+            lensFindings: findings, outsideWalkBytes: outsideWalkBytes
         )
         continuation.yield(.finished(result))
         continuation.finish()

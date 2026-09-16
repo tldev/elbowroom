@@ -1,12 +1,10 @@
 import SwiftUI
-import StoreKit
 
 /// Window anatomy: header 64 pt with the segmented control, Disk Strip
 /// 28 pt (the app's heartbeat, visible in every view), content, and the bottom
 /// tray that materializes on selection and never covers content.
 public struct MainWindow: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.requestReview) private var requestReview
     @FocusState private var searchFocused: Bool
     @State private var searchVisible = false
 
@@ -37,21 +35,16 @@ public struct MainWindow: View {
             sheetView(sheet)
         }
         .task {
-            if model.result == nil && !model.scanning && !model.loadCachedScan() {
-                model.startScan()
+            if model.result == nil && !model.scanning {
+                let restored = await model.loadCachedScan()
+                if !restored && !Task.isCancelled { model.startScan() }
             }
+            // An uninstall interrupted by the App Management grant resumes
+            // here: the switch applies to this launch, not the last one.
+            await model.resumePendingUninstall()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.rescanIfSensible()
-        }
-        // Review prompt: once, 3 s after the first pour of 5 GB or more.
-        .onChange(of: model.reclaimOutcome?.reclaimedBytes) { _, bytes in
-            guard let bytes, bytes >= 5 * 1_000_000_000, !model.settings.reviewAsked else { return }
-            model.settings.reviewAsked = true
-            Task {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                requestReview()
-            }
         }
         // Keyboard map.
         .background {
@@ -62,11 +55,6 @@ public struct MainWindow: View {
                 Button("") { model.openLenses() }.keyboardShortcut("4", modifiers: .command)
                 Button("") { searchVisible = true; searchFocused = true }.keyboardShortcut("f", modifiers: .command)
                 Button("") { model.openReclaimPlan() }.keyboardShortcut(.delete, modifiers: .command)
-                Button("") {
-                    for item in model.trayItems where item.entry.stashable {
-                        model.stashItem(item)
-                    }
-                }.keyboardShortcut("s", modifiers: .command)
             }
             .opacity(0)
             .accessibilityHidden(true)
@@ -211,18 +199,10 @@ public struct MainWindow: View {
         switch sheet {
         case .reclaimPlan:
             ReclaimPlanSheet()
-        case .stashSetup:
-            StashSetupSheet()
-        case .stashCatalog:
-            StashCatalogView()
         case .teach(let flow, let bytes):
             TeachFlowSheet(flowID: flow, bytes: bytes)
         case .cleanup(let entryID):
             CleanupSheet(entryID: entryID)
-        case .paywall(let trigger):
-            PaywallSheet(trigger: trigger)
-        case .reconcile(let entry):
-            ReconcileSheet(entry: entry)
         case .updatePlanner:
             UpdatePlannerSheet()
         case .askKibi(let name, let path, let bytes, let children):
@@ -231,8 +211,7 @@ public struct MainWindow: View {
     }
 }
 
-/// Bottom tray: 56 pt, running total, Reclaim primary, Stash when every
-/// selected item is stash-blessed, Clear.
+/// Bottom tray: 56 pt, running total, Reclaim primary, Clear.
 struct TrayBar: View {
     @Environment(AppModel.self) private var model
 
@@ -249,12 +228,6 @@ struct TrayBar: View {
                     .buttonStyle(.plain)
                     .font(BFont.body)
                     .foregroundStyle(BColor.inkSoft)
-                if model.trayAllStashable {
-                    Button(Copy.trayStash) {
-                        for item in model.trayItems { model.stashItem(item) }
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
-                }
             }
             Button(Copy.trayReclaim) { model.openReclaimPlan() }
                 .buttonStyle(TrayPrimaryButtonStyle(enabled: !empty))

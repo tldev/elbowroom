@@ -1,49 +1,65 @@
 import Foundation
 
-/// One node of the scanned tree. Directories aggregate allocated bytes of their
-/// whole subtree; small children collapse into `collapsedCount`/`collapsedBytes`
-/// so the tree stays bounded in memory on a full-disk scan.
-public final class ScanNode: Identifiable, Hashable {
-    public let id: String // standardized path
+/// A published tree has no mutable references or parent cycles. The scanner
+/// freezes its private builders once; UI edits copy only affected branches.
+public struct ScanNode: Identifiable, Hashable, Sendable {
+    public var id: String { path }
     public let url: URL
-    public let name: String
-    public let isDirectory: Bool
-    public var allocatedBytes: Int64 = 0
-    public var lastTouched: Date?
-    public var children: [ScanNode] = []
-    public var collapsedCount: Int = 0
-    public var collapsedBytes: Int64 = 0
-    public weak var parent: ScanNode?
-    public var atlasEntryID: String?
-    /// Set when this node sits inside a recognized project (nearest `.git` root).
-    public var projectName: String?
-    public var isDataless = false
-    public var isStashed = false
-
-    public init(url: URL, isDirectory: Bool, parent: ScanNode?) {
-        self.url = url
-        self.id = url.path
-        self.name = url.lastPathComponent
-        self.isDirectory = isDirectory
-        self.parent = parent
-    }
-
-    /// Fast-path init for the bulk walk: builds the URL with the directory
-    /// hint so Foundation never stats the path to find out.
-    public convenience init(path: String, isDirectory: Bool, parent: ScanNode?) {
-        self.init(url: URL(fileURLWithPath: path, isDirectory: isDirectory),
-                  isDirectory: isDirectory, parent: parent)
-    }
-
+    public var name: String { url.lastPathComponent }
     public var path: String { url.path }
+    public let isDirectory: Bool
+    public let allocatedBytes: Int64
+    public let lastTouched: Date?
+    public let children: [ScanNode]
+    public let collapsedCount: Int
+    public let collapsedBytes: Int64
+    public let atlasEntryID: String?
+    public let projectName: String?
+    public let isDataless: Bool
 
-    /// Sort children biggest-first; deterministic tie-break by name (stability).
-    public func sortChildren() {
-        children.sort {
-            if $0.allocatedBytes != $1.allocatedBytes { return $0.allocatedBytes > $1.allocatedBytes }
-            return $0.name < $1.name
+    public init(url: URL, isDirectory: Bool, allocatedBytes: Int64 = 0,
+                lastTouched: Date? = nil, children: [ScanNode] = [],
+                collapsedCount: Int = 0, collapsedBytes: Int64 = 0,
+                atlasEntryID: String? = nil, projectName: String? = nil, isDataless: Bool = false) {
+        self.url = url
+        self.isDirectory = isDirectory
+        self.allocatedBytes = allocatedBytes
+        self.lastTouched = lastTouched
+        self.children = children
+        self.collapsedCount = collapsedCount
+        self.collapsedBytes = collapsedBytes
+        self.atlasEntryID = atlasEntryID
+        self.projectName = projectName
+        self.isDataless = isDataless
+    }
+
+    public func find(path: String) -> ScanNode? {
+        if self.path == path { return self }
+        guard path.hasPrefix(self.path == "/" ? "/" : self.path + "/") else { return nil }
+        for child in children {
+            if let found = child.find(path: path) { return found }
         }
-        for c in children { c.sortChildren() }
+        return nil
+    }
+
+    func removing(paths: Set<String>) -> ScanNode {
+        var remaining: [ScanNode] = []
+        var removed: Int64 = 0
+        for child in children {
+            if paths.contains(child.path) {
+                removed += child.allocatedBytes
+            } else if paths.contains(where: { $0.hasPrefix(child.path + "/") }) {
+                let updated = child.removing(paths: paths)
+                removed += child.allocatedBytes - updated.allocatedBytes
+                remaining.append(updated)
+            } else {
+                remaining.append(child)
+            }
+        }
+        return ScanNode(url: url, isDirectory: isDirectory, allocatedBytes: max(0, allocatedBytes - removed),
+                        lastTouched: lastTouched, children: remaining, collapsedCount: collapsedCount,
+                        collapsedBytes: collapsedBytes, atlasEntryID: atlasEntryID,
+                        projectName: projectName, isDataless: isDataless)
     }
 
     public static func == (lhs: ScanNode, rhs: ScanNode) -> Bool { lhs.id == rhs.id }

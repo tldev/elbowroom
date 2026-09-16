@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Swift and release tests
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Select Xcode
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app
+      - name: Test application
+        run: swift test
+      - name: Test release tools
+        run: |
+          python3 -m unittest discover -s Tests/ReleaseTests -v
+          bash -n Scripts/make-app.sh Scripts/make-dmg.sh release.sh test-dmg.sh

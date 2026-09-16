@@ -2,21 +2,24 @@ import SwiftUI
 
 /// The Disk Strip: a 28 pt full-width bar of the boot volume tinted by tier
 /// proportion, free space at the right edge, live headroom figure at the left.
-/// Visible in every view. Hovering shows a legend card near the cursor;
-/// clicking a tier band opens Items filtered to that tier; the headroom
-/// figure opens the current Reclaim plan. Nothing else on the strip reacts
-/// to clicks, so a miss never summons a window.
+/// Visible in every view. Hovering shows a legend card near the cursor, in
+/// its own little window (LegendPanel) so nothing in the hierarchy paints
+/// over it and the window edge never clips it; clicking a tier band opens
+/// Items filtered to that tier; the headroom figure opens the current
+/// Reclaim plan. Nothing else on the strip reacts to clicks, so a miss
+/// never summons a window.
 /// Marks: solid tier fills separated by 2 pt surface gaps; text stays in ink.
 /// Slivers keep a floor width and magnify under the cursor (StripLayout).
 public struct DiskStrip: View {
     @Environment(AppModel.self) private var model
-    @State private var hover = false
     @State private var labelHover = false
     @State private var hoverSegment: Int?
     @State private var mouseX: CGFloat?
     @State private var mouseBarX: CGFloat?
     @State private var cardVisible = false
-    /// Snapshot/test hook: renders the legend card without a real hover.
+    @State private var hostWindow: NSWindow?
+    @State private var stripFrame: CGRect = .zero
+    /// Snapshot/test hook: renders the legend card in-window, no real hover.
     private let pinBreakdown: Bool
 
     public init(pinBreakdown: Bool = false) {
@@ -34,33 +37,34 @@ public struct DiskStrip: View {
         .frame(height: 28)
         .padding(.horizontal, BSpace.l)
         .contentShape(Rectangle())
+        // Tooltip rules: no dwell, no fade, no slide; the card is there the
+        // moment the cursor is, gone the moment it leaves.
         .onHover { h in
-            hover = h
+            cardVisible = h
             if !h { hoverSegment = nil }
         }
         .onContinuousHover(coordinateSpace: .local) { phase in
             if case .active(let p) = phase { mouseX = p.x }
         }
-        // Tooltip rules: a short dwell, then it is simply there. No fade, no
-        // slide; a mouse passing through to the content never flashes it.
-        .task(id: hover) {
-            if hover {
-                try? await Task.sleep(nanoseconds: 350_000_000)
-                guard !Task.isCancelled else { return }
-                cardVisible = true
-            } else {
-                cardVisible = false
-            }
-        }
         .overlay(alignment: .topLeading) {
-            if (cardVisible || pinBreakdown) && !model.stripSegments.isEmpty {
+            if pinBreakdown && !model.stripSegments.isEmpty {
                 GeometryReader { geo in
-                    breakdownCard
+                    breakdownCard(withShadow: true)
                         .offset(x: cardX(in: geo.size.width), y: 34)
                 }
                 .allowsHitTesting(false)
             }
         }
+        .background(HostWindowReader { hostWindow = $0 })
+        .background(GeometryReader { geo in
+            Color.clear
+                .onAppear { stripFrame = geo.frame(in: .global) }
+                .onChange(of: geo.frame(in: .global)) { _, frame in stripFrame = frame }
+        })
+        .onChange(of: cardVisible) { syncLegendPanel() }
+        .onChange(of: mouseX) { syncLegendPanel() }
+        .onChange(of: hoverSegment) { syncLegendPanel() }
+        .onDisappear { LegendPanel.shared.hide() }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Copy.headroom(ByteFormat.string(model.headroomBytes)))
         .accessibilityValue(compositionLine)
@@ -157,23 +161,44 @@ public struct DiskStrip: View {
 
     private func openPlan() {
         let plan = model.items.filter {
-            !$0.isStashed && ($0.entry.tier == .regenerable || $0.entry.tier == .rebuildable)
+            $0.entry.tier == .regenerable || $0.entry.tier == .rebuildable
         }
         model.openReclaimPlan(items: plan.sorted { $0.bytes > $1.bytes })
     }
 
     // MARK: Legend card
 
-    /// Sits just under the strip, trailing the cursor like a tooltip and
-    /// clamped to the window. Legend only; it never takes the mouse.
+    /// Pinned-mode only (snapshots): trailing the cursor, clamped to the
+    /// window. The live card clamps to the screen in LegendPanel instead.
     private func cardX(in width: CGFloat) -> CGFloat {
         let x = (mouseX ?? BSpace.l) + 12
         return min(max(BSpace.l, x), width - cardWidth - BSpace.l)
     }
 
+    /// Show, move, or hide the legend's own window to match hover state.
+    /// The card re-renders on every sync so the lit row tracks the cursor.
+    private func syncLegendPanel() {
+        guard !pinBreakdown else { return }
+        guard cardVisible, !model.stripSegments.isEmpty, let window = hostWindow,
+              let content = window.contentView else {
+            LegendPanel.shared.hide()
+            return
+        }
+        // Strip-local cursor offset -> SwiftUI global (y down) -> screen (y up).
+        let local = NSPoint(x: stripFrame.minX + (mouseX ?? BSpace.l) + 12,
+                            y: stripFrame.minY + 34)
+        let screenPoint = window.convertPoint(toScreen: content.convert(local, to: nil))
+        LegendPanel.shared.show(
+            card: AnyView(breakdownCard(withShadow: false)),
+            topLeft: screenPoint,
+            over: window
+        )
+    }
+
     /// The breakdown behind the strip: one row per mark plus free space,
-    /// hovered mark's row lit.
-    private var breakdownCard: some View {
+    /// hovered mark's row lit. The panel draws its own window shadow, so
+    /// only the pinned in-window card paints one.
+    private func breakdownCard(withShadow: Bool) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(Array(model.stripSegments.enumerated()), id: \.offset) { i, segment in
                 breakdownRow(
@@ -214,7 +239,7 @@ public struct DiskStrip: View {
             RoundedRectangle(cornerRadius: BRadius.card, style: .continuous)
                 .strokeBorder(BColor.line, lineWidth: 1)
         )
-        .shadow(color: BColor.ink.opacity(0.1), radius: 16, y: 6)
+        .shadow(color: withShadow ? BColor.ink.opacity(0.1) : .clear, radius: 16, y: 6)
         .accessibilityHidden(true)
     }
 

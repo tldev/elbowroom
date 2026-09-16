@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Onboarding: five beats in a borderless 720×560 window, progress dots
+/// Onboarding: six beats in a borderless 720×560 window, progress dots
 /// bottom-center. The flow is the app's first minute; there is no skip.
 public struct OnboardingView: View {
     @Environment(AppModel.self) private var model
@@ -13,6 +13,7 @@ public struct OnboardingView: View {
                 switch model.onboarding {
                 case .welcome: WelcomeBeat()
                 case .privacy: PrivacyBeat()
+                case .trashFirst: TrashBeat()
                 case .grant: GrantBeat()
                 case .scanning: ScanBeat()
                 case .reveal: RevealBeat()
@@ -27,14 +28,14 @@ public struct OnboardingView: View {
 
     private var dots: some View {
         HStack(spacing: 8) {
-            ForEach(0..<5, id: \.self) { i in
+            ForEach(0..<6, id: \.self) { i in
                 Circle()
                     .fill(i <= model.onboarding.rawValue ? BColor.brand : BColor.ink.opacity(0.15))
                     .frame(width: 6, height: 6)
             }
         }
         .padding(.bottom, BSpace.l)
-        .accessibilityLabel("Step \(model.onboarding.rawValue + 1) of 5")
+        .accessibilityLabel("Step \(model.onboarding.rawValue + 1) of 6")
     }
 }
 
@@ -86,6 +87,45 @@ struct PrivacyBeat: View {
                 .multilineTextAlignment(.center)
                 .lineSpacing(4)
                 .frame(maxWidth: 440)
+            PrimaryButton(Copy.b1Continue) {
+                withAnimation(BMotion.standard) { model.onboarding = .trashFirst }
+            }
+        }
+        .padding(BSpace.huge)
+    }
+}
+
+// MARK: - The Trash decision
+
+/// The product's one safety default, decided with room to explain it:
+/// reclaims are trash-first, and this beat owns that choice. Settings can
+/// change it later; each plan can override one run.
+struct TrashBeat: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        @Bindable var settings = model.settings
+        VStack(spacing: BSpace.xl) {
+            ZStack {
+                Circle()
+                    .fill(BColor.soil)
+                    .frame(width: 96, height: 96)
+                Image(systemName: "trash")
+                    .font(.system(size: 38, weight: .medium))
+                    .foregroundStyle(BColor.brand)
+            }
+            Text(Copy.trashBeatHeadline)
+                .font(BFont.title)
+                .foregroundStyle(BColor.ink)
+            Text(Copy.trashBeatBody)
+                .font(BFont.body)
+                .foregroundStyle(BColor.ink)
+                .multilineTextAlignment(.center)
+                .lineSpacing(4)
+                .frame(maxWidth: 440)
+            Toggle(Copy.keepInTrashLabel, isOn: $settings.keepInTrashDefault)
+                .toggleStyle(.checkbox)
+                .font(BFont.body)
+                .foregroundStyle(BColor.ink)
             PrimaryButton(Copy.b1Continue) {
                 withAnimation(BMotion.standard) { model.onboarding = .grant }
             }
@@ -466,11 +506,6 @@ struct RevealBeat: View {
                     model.enterMain(.den)
                     model.openReclaimPlan(items: plan)
                 }
-            } else if model.isModest {
-                DoorCard(icon: "externaldrive.fill.badge.plus", title: Copy.b5DoorStash, line: Copy.doorStashModestLine) {
-                    model.enterMain(.den)
-                    model.sheet = .stashSetup
-                }
             } else {
                 DoorCard(icon: "arrow.down.circle.fill", title: Copy.b5DoorReclaim, line: Copy.doorReclaimLine) {
                     model.enterMain(.den)
@@ -479,12 +514,6 @@ struct RevealBeat: View {
             }
             DoorCard(icon: "map.fill", title: Copy.b5DoorExplain, line: Copy.doorExplainLine) {
                 model.enterMain(.crossSection)
-            }
-            if !model.isModest {
-                DoorCard(icon: "externaldrive.fill.badge.plus", title: Copy.b5DoorStash, line: Copy.doorStashLine) {
-                    model.enterMain(.den)
-                    model.sheet = .stashSetup
-                }
             }
         }
     }

@@ -15,6 +15,8 @@ public struct CleanupSheet: View {
     @State private var loading = true
     @State private var running = false
     @State private var failures: [String: String] = [:]
+    @State private var launchAttempt = 0
+    @State private var startingDocker = false
     private let fixture: Bool
 
     public init(entryID: String) {
@@ -46,21 +48,21 @@ public struct CleanupSheet: View {
             header
             Divider()
             content
-            Divider()
-            footer
+            if !loading && blockedReason == nil {
+                Divider()
+                footer
+            }
         }
         .frame(width: 560, height: 580)
         .background(BColor.bg)
-        .onAppear {
+        .task(id: launchAttempt) {
             guard !fixture else { return }
-            Task {
+            if launchAttempt > 0 {
+                await startDocker()
+            } else {
                 let composed = await model.composeCleanupPlan(entryID: entryID)
-                tool = composed.tool
-                actions = composed.actions
-                notes = composed.notes
-                blockedReason = composed.blockedReason
-                estimatedBytes = composed.estimatedBytes
-                loading = false
+                guard !Task.isCancelled else { return }
+                apply(composed)
             }
         }
     }
@@ -94,21 +96,32 @@ public struct CleanupSheet: View {
         if loading {
             HStack(spacing: BSpace.s) {
                 ProgressView().controlSize(.small)
-                Text(Copy.cleanupListing)
+                Text(startingDocker ? Copy.dockerStarting : Copy.cleanupListing)
                     .font(BFont.meta)
                     .foregroundStyle(BColor.inkSoft)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let blockedReason {
             VStack(spacing: BSpace.m) {
-                Text(blockedReason)
+                Text(entryID == "docker.data" && launchAttempt == 0 ? Copy.dockerStartPrompt : blockedReason)
                     .font(BFont.body)
                     .foregroundStyle(BColor.inkSoft)
-                if let flow = entry.teachFlow {
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                if entryID == "docker.data" {
+                    Button(TeachFlow.flow(.docker).doorLabel ?? Copy.showMe) {
+                        loading = true
+                        startingDocker = true
+                        launchAttempt += 1
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .disabled(fixture)
+                } else if let flow = entry.teachFlow {
                     Button(Copy.showMe) { model.sheet = .teach(flow, bytes: 0) }
                         .buttonStyle(SecondarySmallButtonStyle())
                 }
             }
+            .padding(BSpace.sheetPadding)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if actions.isEmpty {
             // Nothing removable: say what stays, so a big row opening an
@@ -389,6 +402,50 @@ public struct CleanupSheet: View {
                 actions = actions.filter { fails[$0.id] != nil || !$0.checked }
                 running = false
             }
+        }
+    }
+
+    private func apply(_ composed: CleanupPlan) {
+        tool = composed.tool
+        actions = composed.actions
+        notes = composed.notes
+        blockedReason = composed.blockedReason
+        estimatedBytes = composed.estimatedBytes
+        loading = false
+    }
+
+    @MainActor
+    private func startDocker() async {
+        defer {
+            loading = false
+            startingDocker = false
+        }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.docker.docker") else {
+            blockedReason = Copy.dockerOpenHelp
+            return
+        }
+        do {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = false
+            _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+            try Task.checkCancellation()
+            NSApp.activate(ignoringOtherApps: true)
+            let deadline = ContinuousClock.now.advanced(by: .seconds(90))
+            repeat {
+                let composed = await model.composeCleanupPlan(entryID: entryID)
+                try Task.checkCancellation()
+                if composed.blockedReason == nil {
+                    apply(composed)
+                    NSApp.activate(ignoringOtherApps: true)
+                    return
+                }
+                try await Task.sleep(for: .seconds(2))
+            } while ContinuousClock.now < deadline
+            blockedReason = Copy.dockerStartupTimeout
+        } catch is CancellationError {
+            return
+        } catch {
+            blockedReason = Copy.dockerOpenHelp
         }
     }
 }

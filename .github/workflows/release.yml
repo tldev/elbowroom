@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elbowroom-release
+  cancel-in-progress: false
+
+jobs:
+  pending:
+    if: github.repository == 'tldev/elbowroom' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      pending: ${{ steps.version.outputs.pending }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 Scripts/release.py --pending
+
+  tests:
+    needs: pending
+    if: needs.pending.outputs.pending == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [pending, tests]
+    if: needs.pending.outputs.pending == 'true'
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NOTARY_PROFILE: elbowroom-ci
+      DEVELOPER_ID: E3A70102B0B9358398E2121EF4808BFEAB8E6DFD
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Prepare build tools
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.3.app
+          brew install create-dmg
+          swift package resolve
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Import signing credentials
+        env:
+          CERTIFICATE_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_PASSWORD }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: python3 Scripts/ci-signing.py setup
+      - name: Build, notarize, and publish
+        run: ./release.sh --publish --ci
+      - name: Preserve release artifacts and notarization results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: elbowroom-release-${{ github.sha }}
+          path: dist/releases/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Remove temporary signing credentials
+        if: always()
+        run: python3 Scripts/ci-signing.py cleanup

@@ -17,6 +17,14 @@ public struct TeachFlowSheet: View {
     private var flow: TeachFlow { TeachFlow.flow(flowID) }
 
     public var body: some View {
+        if flowID == .docker {
+            CleanupSheet(entryID: "docker.data")
+        } else {
+            teachBody
+        }
+    }
+
+    private var teachBody: some View {
         VStack(alignment: .leading, spacing: BSpace.l) {
             HStack(alignment: .firstTextBaseline) {
                 Text(flow.title)
@@ -36,6 +44,18 @@ public struct TeachFlowSheet: View {
                 .font(BFont.body)
                 .foregroundStyle(BColor.ink)
                 .lineSpacing(3)
+
+            if let figure {
+                Image(nsImage: figure)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: BRadius.control))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: BRadius.control)
+                            .strokeBorder(BColor.line, lineWidth: 1)
+                    )
+            }
 
             if let doorLabel = flow.doorLabel {
                 Button {
@@ -94,14 +114,27 @@ public struct TeachFlowSheet: View {
             }
         }
         .padding(BSpace.sheetPadding)
-        .frame(width: 520, height: flow.command == nil ? 300 : 420)
+        .frame(width: 520, height: sheetHeight)
         .background(BColor.bg)
+    }
+
+    /// The figure scales to the sheet's inner width; its height rides along.
+    private var sheetHeight: CGFloat {
+        if let figure { return 296 + figure.size.height * 472 / figure.size.width }
+        return flow.command == nil ? 300 : 420
+    }
+
+    private var figure: NSImage? {
+        guard let base = flow.figure, let url = TeachFigures.url(base) else { return nil }
+        return NSImage(contentsOf: url)
     }
 
     private func openDoor() {
         switch flowID {
         case .simulatorRuntimes:
             NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Xcode.app"))
+        case .sharedWithYou:
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Messages.app"))
         case .deviceBackups:
             NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app"))
         case .trash:
@@ -113,91 +146,6 @@ public struct TeachFlowSheet: View {
             }
         }
         Analytics.shared.log("teach_open", ["flow": flowID.rawValue, "action": "door"])
-    }
-}
-
-// MARK: - Paywall
-
-public struct PaywallSheet: View {
-    @Environment(AppModel.self) private var model
-    let trigger: String
-
-    public init(trigger: String) { self.trigger = trigger }
-
-    public var body: some View {
-        VStack(spacing: BSpace.l) {
-            Text(Copy.paywallTitle)
-                .font(BFont.title)
-                .foregroundStyle(BColor.ink)
-            if trigger == "free_boundary" {
-                Text(Copy.paywallBoundary)
-                    .font(BFont.meta)
-                    .foregroundStyle(BColor.inkSoft)
-            }
-            VStack(alignment: .leading, spacing: BSpace.s) {
-                ForEach(Copy.paywallLines, id: \.self) { line in
-                    Label(line, systemImage: "checkmark")
-                        .font(BFont.body)
-                        .foregroundStyle(BColor.ink)
-                }
-            }
-            Text(model.purchases.priceLine)
-                .font(BFont.body.weight(.semibold))
-                .foregroundStyle(BColor.ink)
-            if model.purchases.busy {
-                ProgressView()
-                    .frame(height: 44)
-            } else if model.purchases.storeReachable {
-                PrimaryButton(Copy.paywallButton) {
-                    Task {
-                        let bought = await model.purchases.purchase()
-                        Analytics.shared.log("paywall", ["trigger": trigger, "outcome": bought ? "purchase" : "cancel"])
-                        if bought { model.sheet = nil }
-                    }
-                }
-            } else {
-                // No App Store product from this build; say so instead of a
-                // button that would lie (register).
-                Text(Copy.paywallUnavailable)
-                    .font(BFont.meta)
-                    .foregroundStyle(BColor.inkSoft)
-                if PurchaseManager.isDevDistribution {
-                    Button(Copy.devUnlock) {
-                        model.pro.unlock()
-                        model.sheet = nil
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .help(Copy.devUnlockNote)
-                }
-            }
-            if let error = model.purchases.lastError {
-                Text(error)
-                    .font(BFont.meta)
-                    .foregroundStyle(BColor.inkSoft)
-            }
-            HStack(spacing: BSpace.l) {
-                Button(Copy.paywallRestore) {
-                    Task {
-                        await model.purchases.restore()
-                        if model.pro.isPro { model.sheet = nil }
-                    }
-                }
-                .buttonStyle(.plain)
-                .font(BFont.meta)
-                .foregroundStyle(BColor.inkSoft)
-                Button(Copy.paywallDecline) {
-                    model.settings.paywallDeclinedAt = Date()
-                    Analytics.shared.log("paywall", ["trigger": trigger, "outcome": "decline"])
-                    model.sheet = nil
-                }
-                .buttonStyle(.plain)
-                .font(BFont.meta)
-                .foregroundStyle(BColor.inkSoft)
-            }
-        }
-        .padding(BSpace.xxl)
-        .frame(width: 420, height: 560)
-        .background(BColor.bg)
     }
 }
 
@@ -221,9 +169,6 @@ public struct UpdatePlannerSheet: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: BSpace.s) {
                         planSection(Copy.plannerReclaimSection, items: plan.reclaimItems)
-                        if !plan.stashSuggestions.isEmpty {
-                            planSection(Copy.plannerStashSection, items: plan.stashSuggestions)
-                        }
                         if !plan.teachItems.isEmpty {
                             Text(Copy.plannerTeachSection)
                                 .font(BFont.meta.weight(.semibold))
@@ -256,9 +201,10 @@ public struct UpdatePlannerSheet: View {
                     Button(Copy.cancel) { model.sheet = nil }
                         .buttonStyle(SecondaryButtonStyle())
                     PrimaryButton(Copy.reclaimPrimary(ByteFormat.string(plan.reclaimItems.reduce(Int64(0)) { $0 + $1.bytes }))) {
-                        model.planItems = plan.reclaimItems
-                        model.planTitle = Copy.planRoomForUpdate
-                        model.sheet = .reclaimPlan(title: model.planTitle)
+                        // Replace this sheet (not stack under the plan),
+                        // through the one entry that resets stale run state.
+                        model.sheet = nil
+                        model.openReclaimPlan(items: plan.reclaimItems, title: Copy.planRoomForUpdate)
                     }
                     .disabled(plan.reclaimItems.isEmpty)
                 }
@@ -300,4 +246,3 @@ public struct UpdatePlannerSheet: View {
 }
 
 // MARK: - First-Rebuildable confirmation
-

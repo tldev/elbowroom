@@ -1,0 +1,10 @@
+{
+  "version": "1.1.0",
+  "build": 3,
+  "minimum_macos": "14.0",
+  "repository": "tldev/elbowroom",
+  "bundle_id": "dev.elbowroom.app",
+  "sparkle_key_account": "elbowroom",
+  "sparkle_public_key": "wbsTbhGfrWIhs7JTSdYQwc6s8zC62QPYB7CY3It4IdQ=",
+  "notary_profile": "notarytool-dorso"
+}

@@ -25,13 +25,38 @@ public enum DiskAccess {
     /// macOS applies a Full Disk Access grant to an already-running app only
     /// after a relaunch; System Settings offers "Quit & Reopen" itself, this
     /// is the in-app equivalent.
+    ///
+    /// A helper waits for this process to die and only then reopens, so
+    /// exactly one instance exists at every moment. `open -n` cannot do
+    /// this: it launches the second copy immediately, and when the quit is
+    /// deferred (a modal sheet defers it) the instances pile up. Terminate
+    /// can be deferred here too, so a grace period backs it with exit();
+    /// every store writes through on change, so there is nothing to lose.
     @MainActor
-    public static func relaunch() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-n", Bundle.main.bundleURL.path]
-        try? process.run()
+    public static func relaunch(afterSeconds grace: TimeInterval = 1.5) {
+        let path = Bundle.main.bundleURL.path.replacingOccurrences(of: "'", with: "'\\''")
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = [
+            "-c",
+            "while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.1; done; /usr/bin/open '\(path)'",
+        ]
+        try? helper.run()
         NSApp.terminate(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + grace) { exit(0) }
+    }
+}
+
+/// App Management settings. There is no supported permission query here:
+/// rename-to-self can fail for unrelated reasons or skip authorization entirely.
+/// Access failures are handled after a user-confirmed operation instead.
+public enum AppManagement {
+    public static let settingsPane = "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles"
+
+    @MainActor
+    public static func openSettings() {
+        if let url = URL(string: settingsPane) { NSWorkspace.shared.open(url) }
     }
 }
 

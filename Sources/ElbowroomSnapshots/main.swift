@@ -6,24 +6,26 @@ import ElbowroomKit
 // with fixture data and writes PNGs in both appearances.
 // Usage: swift run ElbowroomSnapshots [outputDir]
 
+let processStarted = DispatchTime.now().uptimeNanoseconds
+
 let outDir = URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "Design/snapshots")
 try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+
+// Fixture rendering uses its own stores and never sweeps the user's Trash.
+let fixtureSuite = "elbowroom-snapshots-" + UUID().uuidString
+let fixtureDefaults = UserDefaults(suiteName: fixtureSuite)!
+let fixtureDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(fixtureSuite)
 
 let app = NSApplication.shared
 app.setActivationPolicy(.prohibited)
 
 @MainActor
 func makeModel(reveal: Bool = false) -> AppModel {
-    let model = AppModel()
+    let model = AppModel(settings: SettingsStore(defaults: fixtureDefaults),
+                         receipts: ReceiptStore(directory: fixtureDirectory),
+                         changeLog: ChangeLog(directory: fixtureDirectory), startServices: false,
+                         scanCacheURL: fixtureDirectory.appendingPathComponent("scan-cache.json"))
     model.result = Fixtures.scanResult()
-    // Mirror findings the way finishScan does, so Personal rows render.
-    model.lensFindings = model.result?.lensFindings ?? []
-    // Adopted drive fixture so offload surfaces render (card, Items scope).
-    let vol = FileManager.default.temporaryDirectory
-        .appendingPathComponent("elbowroom-snapshots", isDirectory: true)
-        .appendingPathComponent("Dev Drive", isDirectory: true)
-    try? FileManager.default.createDirectory(at: vol, withIntermediateDirectories: true)
-    model.stash = try? StashManager(volume: vol)
     if reveal {
         model.inMain = false
         model.onboarding = .reveal
@@ -64,6 +66,112 @@ func snap<V: View>(_ name: String, size: NSSize, dark: Bool, @ViewBuilder view: 
     window.orderOut(nil)
 }
 
+// Repeatable, isolated UI timings. These include offscreen AppKit layout, not
+// display-server frame presentation; the live application is never touched.
+@MainActor
+func renderPerformance() {
+    let args = CommandLine.arguments
+    let index = args.firstIndex(of: "--items")
+    let count = max(1, index.flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 10_000)
+    var lines: [String] = ["rows: \(count)"]
+    func elapsed(_ start: UInt64) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+    }
+    func record(_ name: String, _ ms: Double) {
+        let line = String(format: "%@: %.3fms", name, ms)
+        lines.append(line)
+        print(line)
+    }
+    func settle(until ready: () -> Bool) {
+        let deadline = Date().addingTimeInterval(15)
+        repeat { RunLoop.main.run(until: Date().addingTimeInterval(0.001)) }
+        while !ready() && Date() < deadline
+        precondition(ready(), "UI benchmark did not settle")
+    }
+    let modelStart = DispatchTime.now().uptimeNanoseconds
+    let model = makeModel()
+    var fixture = model.result!
+    fixture.items = (0..<max(1, count)).map { index in
+        AtlasItem(entryID: "js.nodeModules", url: URL(fileURLWithPath: "/fixture/project-\(index)/node_modules"),
+                  bytes: Int64(count - index) * 4096, lastTouched: .distantPast, projectName: "project-\(index)")
+    }
+    fixture.lensFindings = []
+    model.result = fixture
+    record("model-and-fixture", elapsed(modelStart))
+
+    let projection = LedgerModel()
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1080, height: 720),
+                          styleMask: [.borderless], backing: .buffered, defer: false)
+    let hosting = NSHostingView(rootView: LedgerView(projection: projection).environment(model)
+        .frame(width: 1080, height: 720))
+    window.contentView = hosting
+    window.orderBack(nil)
+    settle { projection.completedQuery != nil }
+    hosting.layoutSubtreeIfNeeded()
+    window.displayIfNeeded()
+    record("process-entry-to-first-fixture-layout", elapsed(processStarted))
+
+    var searchTimes: [Double] = []
+    for search in ["project-1", "project-22", "project-333", "node_modules", ""] {
+        let start = DispatchTime.now().uptimeNanoseconds
+        model.searchText = search
+        settle { projection.completedQuery?.search == search }
+        hosting.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        searchTimes.append(elapsed(start))
+    }
+    searchTimes.sort()
+    record("search-to-layout.median", searchTimes[searchTimes.count / 2])
+    record("search-to-layout.max", searchTimes.last!)
+
+    func scrollView(_ view: NSView) -> NSScrollView? {
+        if let scroll = view as? NSScrollView { return scroll }
+        for child in view.subviews {
+            if let scroll = scrollView(child) { return scroll }
+        }
+        return nil
+    }
+    // Allow SwiftUI to install and lay out its scroll host after projection.
+    RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    if let scroll = scrollView(hosting), let document = scroll.documentView {
+        for jumping in [false, true] {
+            var times: [Double] = []
+        for step in 0..<30 {
+            let start = DispatchTime.now().uptimeNanoseconds
+            let maxY = max(0, document.bounds.height - scroll.contentView.bounds.height)
+            let y = jumping ? maxY * CGFloat(step) / 29 : min(maxY, CGFloat(step) * 60)
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.001))
+            hosting.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            times.append(elapsed(start))
+        }
+        times.sort()
+        record(jumping ? "scroll-jump.median" : "scroll-step.median", times[times.count / 2])
+        record(jumping ? "scroll-jump.p95" : "scroll-step.p95", times[28])
+        }
+    } else {
+        preconditionFailure("No scroll view found for UI benchmark")
+    }
+    window.orderOut(nil)
+
+    let cache = fixtureDirectory.appendingPathComponent("scan-cache.json")
+    ScanCache.save(fixture, rootPath: fixtureDirectory.path, to: cache)
+    let cachedStart = DispatchTime.now().uptimeNanoseconds
+    let cachedModel = makeModel()
+    cachedModel.result = nil
+    cachedModel.scanRoot = fixtureDirectory
+    var restored = false
+    Task { restored = await cachedModel.loadCachedScan() }
+    settle { restored }
+    record("cached-model-restore", elapsed(cachedStart))
+    var usage = rusage()
+    getrusage(RUSAGE_SELF, &usage)
+    lines.append(String(format: "peak RSS: %.1f MiB", Double(usage.ru_maxrss) / 1_048_576))
+    try? lines.joined(separator: "\n").write(to: outDir.appendingPathComponent("performance.txt"), atomically: true, encoding: .utf8)
+}
+
 @MainActor
 func renderAll() {
 let mainSize = NSSize(width: 1080, height: 720)
@@ -71,7 +179,7 @@ let onboardingSize = NSSize(width: 720, height: 560)
 
 for dark in [false, true] {
     // Onboarding beats
-    for (name, beat) in [("b1-welcome", OnboardingBeat.welcome), ("b2-privacy", .privacy)] {
+    for (name, beat) in [("b1-welcome", OnboardingBeat.welcome), ("b2-privacy", .privacy), ("b3-trash-first", .trashFirst)] {
         snap(name, size: onboardingSize, dark: dark) {
             let m = makeModel()
             m.inMain = false
@@ -117,6 +225,17 @@ for dark in [false, true] {
         OnboardingView().environment(makeModel(reveal: true))
     }
 
+    // Flat merged rows and localized text wrapping.
+    snap("ledger-merged", size: mainSize, dark: dark) {
+        LedgerView().environment(makeModel())
+    }
+    let priorLanguage = Loc.lang
+    Loc.lang = "ja"
+    snap("ledger-merged-ja", size: mainSize, dark: dark) {
+        LedgerView().environment(makeModel())
+    }
+    Loc.lang = priorLanguage
+
     // Main views
     snap("ledger-selected", size: mainSize, dark: dark) {
         let m = makeModel()
@@ -143,6 +262,12 @@ for dark in [false, true] {
         .background(BColor.bg)
         .environment(makeModel())
     }
+    // Keep the storage reconciliation copy visible in an isolated full-height render.
+    snap("den-storage-balance", size: NSSize(width: 1080, height: 1120), dark: dark) {
+        let m = makeModel()
+        m.view = .den
+        return MainWindow().environment(m)
+    }
     for (name, tab) in [("den", MainView.den), ("cross-section", .crossSection), ("ledger", .ledger), ("changes", .changes)] {
         snap(name, size: mainSize, dark: dark) {
             let m = makeModel()
@@ -154,6 +279,11 @@ for dark in [false, true] {
             }
             return MainWindow().environment(m)
         }
+    }
+
+    snap("cleanup-docker-start", size: NSSize(width: 560, height: 580), dark: dark) {
+        CleanupSheet(fixturePlan: CleanupPlan(tool: .docker, entryID: "docker.data", actions: [],
+                                            blockedReason: Copy.containerAppStart)).environment(makeModel())
     }
 
     // Docker sheet with the volumes group in its mixed state.
@@ -234,23 +364,34 @@ for dark in [false, true] {
         m.planItems = m.items.filter { $0.entry.tier == .regenerable || $0.entry.tier == .rebuildable }
         return ReclaimPlanSheet().environment(m)
     }
-    snap("stash-catalog", size: NSSize(width: 620, height: 540), dark: dark) {
-        let m = makeModel()
-        // A real (temp-dir) stash so the list renders; groups need no moves.
-        let vol = FileManager.default.temporaryDirectory
-            .appendingPathComponent("elbowroom-snapshots", isDirectory: true)
-            .appendingPathComponent("Dev Drive", isDirectory: true)
-        try? FileManager.default.createDirectory(at: vol, withIntermediateDirectories: true)
-        m.stash = try? StashManager(volume: vol)
-        return StashCatalogView(initiallyExpanded: ["js.nodeModules"]).environment(m)
-    }
-    snap("stash-setup", size: NSSize(width: 520, height: 500), dark: dark) {
-        let vols = Fixtures.externalVolumes()
-        return StashSetupSheet(fixtureVolumes: vols, picked: vols.first, speed: Fixtures.speedResult())
-            .environment(makeModel())
-    }
     snap("teach-docker", size: NSSize(width: 520, height: 420), dark: dark) {
         TeachFlowSheet(flowID: .docker, bytes: 61_400_000_000).environment(makeModel())
+    }
+
+    // Uninstall review opens without a speculative permission gate.
+    let iMovie = AtlasItem(
+        entryID: "app.bundle",
+        url: URL(fileURLWithPath: "/Applications/iMovie.app"),
+        bytes: 3_100_000_000, lastTouched: nil, projectName: "iMovie"
+    )
+    snap("uninstall-plan", size: NSSize(width: 640, height: 540), dark: dark) {
+        let m = makeModel()
+        m.planItems = [iMovie]
+        m.planTitle = Copy.uninstallTitle(iMovie.displayName)
+        return ReclaimPlanSheet().environment(m)
+    }
+
+    snap("uninstall-denied", size: NSSize(width: 640, height: 540), dark: dark) {
+        let m = makeModel()
+        m.planItems = [iMovie]
+        m.planTitle = Copy.uninstallTitle(iMovie.displayName)
+        m.reclaimOutcome = Fixtures.deniedUninstall(iMovie)
+        return ReclaimPlanSheet().environment(m)
+    }
+
+    // The figure-bearing teach sheet: annotated Messages settings capture.
+    snap("teach-shared-with-you", size: NSSize(width: 520, height: 641), dark: dark) {
+        TeachFlowSheet(flowID: .sharedWithYou, bytes: 2_100_000_000).environment(makeModel())
     }
     snap("cleanup-simctl", size: NSSize(width: 560, height: 580), dark: dark) {
         CleanupSheet(fixturePlan: Fixtures.cleanupPlan()).environment(makeModel())
@@ -259,14 +400,34 @@ for dark in [false, true] {
     snap("cleanup-tm-snapshots", size: NSSize(width: 560, height: 580), dark: dark) {
         CleanupSheet(fixturePlan: Fixtures.tmCleanupPlan()).environment(makeModel())
     }
-    snap("paywall", size: NSSize(width: 420, height: 560), dark: dark) {
-        PaywallSheet(trigger: "free_boundary").environment(makeModel())
+    snap("settings-updates", size: NSSize(width: 540, height: 460), dark: dark) {
+        ElbowroomSettingsView(automaticUpdates: .constant(true)).environment(makeModel())
+    }
+    snap("about-version", size: NSSize(width: 320, height: 340), dark: dark) {
+        AboutView().environment(makeModel())
+    }
+
+    // B3: the PermissionFlow-style drag helper, waiting and granted.
+    let helperWaiting = GrantHelperState()
+    let helperGranted = GrantHelperState()
+    helperGranted.granted = true
+    snap("grant-helper", size: NSSize(width: 620, height: 320), dark: dark) {
+        HStack(spacing: BSpace.l) {
+            GrantHelperCard(state: helperWaiting)
+            GrantHelperCard(state: helperGranted)
+        }
+        .padding(BSpace.l)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(BColor.desk)
     }
 }
 }
 
 MainActor.assumeIsolated {
-    renderAll()
+    if CommandLine.arguments.contains("--performance") { renderPerformance() }
+    else { renderAll() }
 }
+fixtureDefaults.removePersistentDomain(forName: fixtureSuite)
+try? FileManager.default.removeItem(at: fixtureDirectory)
 print("done")
 exit(0)

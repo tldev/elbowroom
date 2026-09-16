@@ -91,6 +91,37 @@ final class CopyRulesTests: XCTestCase {
         for flow in TeachFlow.flows.values {
             XCTAssertNotNil(Loc.jaStrings[flow.title], "No ja for teach title: \(flow.title)")
             XCTAssertNotNil(Loc.jaStrings[flow.why], "No ja for teach why: \(flow.why)")
+            if let door = flow.doorLabel {
+                XCTAssertNotNil(Loc.jaStrings[door], "No ja for teach door: \(door)")
+            }
+            if let gloss = flow.commandGloss {
+                XCTAssertNotNil(Loc.jaStrings[gloss], "No ja for teach gloss: \(gloss)")
+            }
+            if let warning = flow.warning {
+                XCTAssertNotNil(Loc.jaStrings[warning], "No ja for teach warning: \(warning)")
+            }
+        }
+    }
+
+    /// Every sound the app can play resolves to a shipped file.
+    func testAllSoundsShip() {
+        for sound in ElbowroomSound.allCases {
+            XCTAssertNotNil(SoundPlayer.resourceURL(sound), "missing sound: \(sound.rawValue)")
+        }
+    }
+
+    /// The Shared with You item teaches its own flow (not the Photos library
+    /// one), and the flow's annotated settings figure ships in the bundle.
+    func testSharedWithYouFlowAndFigure() {
+        XCTAssertEqual(Atlas.entry("sys.photosSyndication").teachFlow, .sharedWithYou)
+        let flow = TeachFlow.flow(.sharedWithYou)
+        XCTAssertEqual(flow.figure, "teach-shared-with-you")
+        let saved = Loc.lang
+        defer { Loc.lang = saved }
+        for lang in ["en", "ja"] {
+            Loc.lang = lang
+            XCTAssertNotNil(TeachFigures.url("teach-shared-with-you"),
+                            "figure missing for lang \(lang)")
         }
     }
 
@@ -104,7 +135,7 @@ final class CopyRulesTests: XCTestCase {
 
     /// Kibi lines are 6 words or fewer.
     func testKibiLinesShort() {
-        for line in [Copy.kibiDenTidy, Copy.kibiReceiptsEmpty, Copy.kibiStashEmpty,
+        for line in [Copy.kibiDenTidy, Copy.kibiReceiptsEmpty,
                      Copy.kibiChangesQuiet, Copy.kibiSearchNone] {
             XCTAssertLessThanOrEqual(line.split(separator: " ").count, 6, line)
         }
@@ -115,9 +146,7 @@ final class CopyRulesTests: XCTestCase {
         XCTAssertTrue(Copy.fdaOpen.hasPrefix("Open"))
         XCTAssertTrue(Copy.b3StartScan.hasPrefix("Start"))
         XCTAssertTrue(Copy.b3Relaunch.hasPrefix("Relaunch"))
-        XCTAssertTrue(Copy.paywallButton.hasPrefix("Unlock"))
         XCTAssertTrue(Copy.reclaimPrimary("5 GB").hasPrefix("Reclaim"))
-        XCTAssertTrue(Copy.offboarding.hasPrefix("Move"))
     }
 
     /// B3: the guided fallback lists only the consent zones that exist on

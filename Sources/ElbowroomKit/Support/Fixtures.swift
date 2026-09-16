@@ -3,11 +3,17 @@ import Foundation
 /// Deterministic fixture data for design snapshots and demos: a plausible
 /// 512 GB developer Mac.
 public enum Fixtures {
-    public static func scanResult() -> ScanResult {
-        let root = ScanNode(url: URL(fileURLWithPath: "/"), isDirectory: true, parent: nil)
+    public static func deniedUninstall(_ item: AtlasItem) -> ReclaimOutcome {
+        ReclaimOutcome(reclaimedBytes: 0, doneCount: 0,
+                       skipped: [(item.displayName, CocoaError(.fileWriteNoPermission).localizedDescription)],
+                       receipt: nil, cancelled: false, accessDeniedAppPaths: [item.url.path])
+    }
 
-        func node(_ path: String, _ bytes: Int64, parent: ScanNode, touched: TimeInterval = -3 * 86_400) -> ScanNode {
-            let n = ScanNode(url: URL(fileURLWithPath: path), isDirectory: true, parent: parent)
+    public static func scanResult() -> ScanResult {
+        let root = ScanNodeBuilder(url: URL(fileURLWithPath: "/"), isDirectory: true, parent: nil)
+
+        func node(_ path: String, _ bytes: Int64, parent: ScanNodeBuilder, touched: TimeInterval = -3 * 86_400) -> ScanNodeBuilder {
+            let n = ScanNodeBuilder(url: URL(fileURLWithPath: path), isDirectory: true, parent: parent)
             n.allocatedBytes = bytes
             n.lastTouched = Date().addingTimeInterval(touched)
             parent.children.append(n)
@@ -43,17 +49,17 @@ public enum Fixtures {
         let brewCache = node("/Users/dev/Library/Caches/Homebrew", 1_900_000_000, parent: caches)
         let spotifyCache = node("/Users/dev/Library/Caches/com.spotify.client", 1_400_000_000, parent: caches)
         let apps = node("/Applications", 38_000_000_000, parent: root)
+        let slack = node("/Applications/Slack.app", 1_400_000_000, parent: apps, touched: -9 * 86_400)
+        slack.atlasEntryID = "app.bundle"
         _ = node("/Users/dev/Documents", 92_000_000_000, parent: home)
         _ = node("/Users/dev/Pictures", 31_000_000_000, parent: home)
         let mlProject = node("/Users/dev/projects/ml-experiments", 7_800_000_000, parent: projects, touched: -240 * 86_400)
         for i in 0..<9 {
             _ = node("/Users/dev/projects/side-\(i)", Int64(400_000_000 + i * 130_000_000), parent: projects, touched: -Double(200 + i * 30) * 86_400)
         }
-        _ = apps
 
-        func item(_ entry: String, _ n: ScanNode, project: String? = nil) -> AtlasItem {
-            var i = AtlasItem(entryID: entry, url: n.url, bytes: n.allocatedBytes, lastTouched: n.lastTouched, projectName: project)
-            _ = i.entry
+        func item(_ entry: String, _ n: ScanNodeBuilder, project: String? = nil) -> AtlasItem {
+            let i = AtlasItem(entryID: entry, url: n.url, bytes: n.allocatedBytes, lastTouched: n.lastTouched, projectName: project)
             n.atlasEntryID = entry
             return i
         }
@@ -82,12 +88,36 @@ public enum Fixtures {
             url: URL(fileURLWithPath: "/System/Volumes/Data"),
             bytes: 13_500_000_000, lastTouched: nil
         ))
+        // One app with its Library residue counted beside it, and the
+        // container's sibling volumes as System rows.
+        items.append(AtlasItem(
+            entryID: "app.bundle", url: slack.url, bytes: 2_900_000_000,
+            lastTouched: slack.lastTouched, projectName: "Slack"
+        ))
+        items.append(contentsOf: SystemSpace.items(container: ContainerInfo(
+            osBytes: 20_800_000_000, prebootBytes: 16_000_000_000, vmBytes: 9_700_000_000
+        )))
+        items.append(contentsOf: [
+            AtlasItem(entryID: "storage.appCache", url: URL(fileURLWithPath: "/Users/dev/Library/Caches/com.tinyspeck.slackmacgap"),
+                      bytes: 200_000_000, lastTouched: Date(), projectName: "Slack"),
+            AtlasItem(entryID: "storage.toolPackages", url: URL(fileURLWithPath: "/opt/homebrew"),
+                      bytes: 5_600_000_000, lastTouched: nil),
+            AtlasItem(entryID: "storage.search", url: URL(fileURLWithPath: "/Users/dev/Library/Metadata/CoreSpotlight"),
+                      bytes: 1_900_000_000, lastTouched: nil),
+            AtlasItem(entryID: "storage.appCache", url: URL(fileURLWithPath: "/Users/dev/Library/Application Support/Slack/Cache"),
+                      bytes: 900_000_000, lastTouched: Date(), projectName: "Slack"),
+            AtlasItem(entryID: "ml.ollama", url: URL(fileURLWithPath: "/Users/dev/.ollama/models"),
+                      bytes: 4_600_000_000, lastTouched: nil),
+        ])
+        if let slackIndex = items.firstIndex(where: { $0.id == slack.path }) {
+            items[slackIndex].bytes -= 1_100_000_000
+        }
         items.sort { $0.bytes > $1.bytes }
 
         // Roll subtree sizes up: parents report the sum of their children,
         // exactly as the scan engine does while walking.
         @discardableResult
-        func rollUp(_ n: ScanNode) -> Int64 {
+        func rollUp(_ n: ScanNodeBuilder) -> Int64 {
             guard !n.children.isEmpty else { return n.allocatedBytes }
             let sum = n.children.reduce(Int64(0)) { $0 + rollUp($1) }
             n.allocatedBytes = max(n.allocatedBytes, sum)
@@ -104,7 +134,7 @@ public enum Fixtures {
             snapshotCount: 3
         )
         let result = ScanResult(
-            root: root,
+            root: root.snapshot(),
             items: items,
             repoStaleness: [:],
             deniedPaths: [],
@@ -121,25 +151,7 @@ public enum Fixtures {
         return result
     }
 
-    /// Volumes and speed for setup-sheet snapshots.
-    public static func externalVolumes() -> [ExternalVolume] {
-        [
-            ExternalVolume(
-                id: "/Volumes/Dev Drive", url: URL(fileURLWithPath: "/Volumes/Dev Drive"),
-                name: "Dev Drive", isAPFS: true, isInternal: false, isNetwork: false,
-                available: 3_600_000_000_000, totalCapacity: 4_000_000_000_000
-            ),
-            ExternalVolume(
-                id: "/Volumes/media", url: URL(fileURLWithPath: "/Volumes/media"),
-                name: "media", isAPFS: false, isInternal: false, isNetwork: true,
-                available: 900_000_000_000, totalCapacity: 2_000_000_000_000
-            ),
-        ]
-    }
 
-    public static func speedResult() -> SpeedTest.Result {
-        SpeedTest.Result(bytesPerSecond: 360_000_000)
-    }
 
     /// Fixture plan for tmutil sheet: two snapshots, a network
     /// destination to reassure about, and the "up to" estimate.
@@ -181,14 +193,10 @@ public enum Fixtures {
                 argv: ["simctl", "delete", "51F1AA00-9C3D"], checked: false
             ),
             ToolAction(
-                id: "sim.offload.current", title: "iOS 18.2 (22C150)",
-                detail: Copy.runtimeOffloadDetail("Dev Drive"), bytes: 8_100_000_000,
-                argv: ["simctl", "runtime", "delete", "9F3BB1D2-4C5E"], checked: true,
-                warning: Copy.runtimeCurrentWarning,
-                preCopy: ToolAction.PreCopy(
-                    from: "/System/Library/AssetsV2/iOSSimulatorRuntime/094-26194.dmg",
-                    to: "/Volumes/Dev Drive/Stash/Runtimes/iOS 18.2 (22C150).dmg"
-                )
+                id: "sim.runtime.current", title: "iOS 18.2 (22C150)",
+                detail: Copy.runtimeCurrentDetail("8.1 GB"), bytes: 8_100_000_000,
+                argv: ["simctl", "runtime", "delete", "9F3BB1D2-4C5E"], checked: false,
+                warning: Copy.runtimeCurrentWarning
             ),
         ])
     }

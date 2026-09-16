@@ -119,6 +119,35 @@ final class ScanEngineTests: XCTestCase {
         XCTAssertLessThanOrEqual(childSum, total)
     }
 
+    func testSymlinksDoNotAddBytesOrCreateCycles() async throws {
+        let before = try await runScan()
+        try fm.createSymbolicLink(at: root.appendingPathComponent("cycle"), withDestinationURL: root)
+        try fm.createSymbolicLink(at: root.appendingPathComponent("linked-file"),
+                                  withDestinationURL: root.appendingPathComponent("docs/notes.txt"))
+        let after = try await runScan()
+        XCTAssertEqual(after.scannedBytes, before.scannedBytes)
+        XCTAssertEqual(after.root.allocatedBytes, before.root.allocatedBytes)
+    }
+
+    func testBulkReaderMatchesFallbackAcrossBatches() throws {
+        let directory = root.appendingPathComponent("bulk")
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        for i in 0..<3500 {
+            try Data(repeating: 42, count: i % 128).write(to: directory.appendingPathComponent("file-\(i)"))
+        }
+        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: BulkDir.bufferSize, alignment: 16)
+        defer { buffer.deallocate() }
+        var bulk: [BulkEntry] = [], fallback: [BulkEntry] = []
+        try BulkDir.read(path: directory.path, buffer: buffer, into: &bulk)
+        try BulkDir.readViaFileManager(path: directory.path, into: &fallback)
+        bulk.sort { $0.name < $1.name }
+        fallback.sort { $0.name < $1.name }
+        XCTAssertEqual(bulk.count, 3500)
+        XCTAssertEqual(bulk.map(\.name), fallback.map(\.name))
+        XCTAssertEqual(bulk.map(\.allocated), fallback.map(\.allocated))
+        XCTAssertEqual(bulk.map(\.logical), fallback.map(\.logical))
+    }
+
     private func snapshot() throws -> [String] {
         var lines: [String] = []
         let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey])
@@ -134,9 +163,9 @@ final class BrewCellarTests: XCTestCase {
     /// Two kept versions → the older one's bytes aggregate; single-version
     /// formulas contribute nothing (Homebrew pack).
     func testOldVersionsAggregate() {
-        let root = ScanNode(url: URL(fileURLWithPath: "/"), isDirectory: true, parent: nil)
-        func dir(_ path: String, _ bytes: Int64, parent: ScanNode) -> ScanNode {
-            let n = ScanNode(url: URL(fileURLWithPath: path), isDirectory: true, parent: parent)
+        let root = ScanNodeBuilder(url: URL(fileURLWithPath: "/"), isDirectory: true, parent: nil)
+        func dir(_ path: String, _ bytes: Int64, parent: ScanNodeBuilder) -> ScanNodeBuilder {
+            let n = ScanNodeBuilder(url: URL(fileURLWithPath: path), isDirectory: true, parent: parent)
             n.allocatedBytes = bytes
             parent.children.append(n)
             return n
@@ -158,13 +187,13 @@ final class BrewCellarTests: XCTestCase {
     }
 
     func testBelowThresholdIgnored() {
-        let root = ScanNode(url: URL(fileURLWithPath: "/"), isDirectory: true, parent: nil)
+        let root = ScanNodeBuilder(url: URL(fileURLWithPath: "/"), isDirectory: true, parent: nil)
         XCTAssertTrue(ScanEngine.brewOldVersionItems(root: root).isEmpty)
     }
 }
 
 final class ScanCacheTests: XCTestCase {
-    /// The whole result round-trips: tree, parents, items, disk, dates.
+    /// The whole value snapshot round-trips: tree, items, disk, dates.
     func testRoundTrip() throws {
         let original = Fixtures.scanResult()
         let data = try JSONEncoder().encode(original)
@@ -177,11 +206,10 @@ final class ScanCacheTests: XCTestCase {
         XCTAssertEqual(restored.disk.available, original.disk.available)
         XCTAssertEqual(restored.finishedAt.timeIntervalSince1970,
                        original.finishedAt.timeIntervalSince1970, accuracy: 0.001)
-        // Parent wiring rebuilt on decode.
+        // Path lookup works on the decoded immutable tree.
         let users = restored.root.children.first { $0.name == "Users" }
         XCTAssertNotNil(users)
-        XCTAssertTrue(users?.parent === restored.root)
-        XCTAssertTrue(users?.children.first?.parent === users)
+        XCTAssertEqual(restored.root.find(path: users!.path)?.path, users?.path)
     }
 }
 
@@ -223,6 +251,7 @@ final class BrokeredTrashTests: XCTestCase {
     }
 }
 
+@MainActor
 final class ChangeLogTests: XCTestCase {
     func testWeekDeltasNeedTwoSnapshots() {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

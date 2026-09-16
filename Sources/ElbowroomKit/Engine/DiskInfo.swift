@@ -25,7 +25,13 @@ public struct DiskSnapshot: Sendable, Codable {
         self.capturedAt = capturedAt
     }
 
+    /// Full measurement for a background scan, including the tmutil probe.
     public static func capture(for url: URL = URL(fileURLWithPath: "/")) -> DiskSnapshot {
+        captureSpace(for: url, snapshotCount: localSnapshotCount())
+    }
+
+    /// Capacity only: no subprocess. Preserve the last known snapshot count.
+    public static func captureSpace(for url: URL = URL(fileURLWithPath: "/"), snapshotCount: Int = 0) -> DiskSnapshot {
         let keys: Set<URLResourceKey> = [
             .volumeNameKey, .volumeTotalCapacityKey,
             .volumeAvailableCapacityKey, .volumeAvailableCapacityForImportantUsageKey,
@@ -36,7 +42,7 @@ public struct DiskSnapshot: Sendable, Codable {
             totalCapacity: Int64(values?.volumeTotalCapacity ?? 0),
             available: Int64(values?.volumeAvailableCapacity ?? 0),
             availableForImportant: values?.volumeAvailableCapacityForImportantUsage ?? 0,
-            snapshotCount: localSnapshotCount()
+            snapshotCount: snapshotCount
         )
     }
 
@@ -59,56 +65,6 @@ public struct DiskSnapshot: Sendable, Codable {
             return out.split(separator: "\n").filter { $0.contains("com.apple.TimeMachine") }.count
         } catch {
             return 0
-        }
-    }
-}
-
-/// External volumes eligible as Stash destinations.
-public struct ExternalVolume: Identifiable, Sendable {
-    public let id: String
-    public let url: URL
-    public let name: String
-    public let isAPFS: Bool
-    public let isInternal: Bool
-    public let isNetwork: Bool
-    public let available: Int64
-    public let totalCapacity: Int64
-
-    public var eligible: Bool { isAPFS && !isInternal && !isNetwork }
-    public var ineligibleReason: String? {
-        if isNetwork { return Copy.volNetworkNo }
-        if isInternal { return Copy.volInternalNo }
-        if !isAPFS { return Copy.needsAPFS }
-        return nil
-    }
-
-    public static func mounted() -> [ExternalVolume] {
-        let keys: [URLResourceKey] = [
-            .volumeNameKey, .volumeIsInternalKey, .volumeIsLocalKey, .volumeIsBrowsableKey,
-            .volumeAvailableCapacityKey, .volumeTotalCapacityKey, .volumeIsRootFileSystemKey,
-        ]
-        let urls = FileManager.default.mountedVolumeURLs(
-            includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]
-        ) ?? []
-        return urls.compactMap { url in
-            guard let v = try? url.resourceValues(forKeys: Set(keys)),
-                  v.volumeIsRootFileSystem != true,
-                  url.path.hasPrefix("/Volumes/")
-            else { return nil }
-            var isAPFS = false
-            if let fsType = try? url.resourceValues(forKeys: [.volumeTypeNameKey]).volumeTypeName {
-                isAPFS = fsType.lowercased().contains("apfs")
-            }
-            return ExternalVolume(
-                id: url.path,
-                url: url,
-                name: v.volumeName ?? url.lastPathComponent,
-                isAPFS: isAPFS,
-                isInternal: v.volumeIsInternal ?? false,
-                isNetwork: !(v.volumeIsLocal ?? true),
-                available: Int64(v.volumeAvailableCapacity ?? 0),
-                totalCapacity: Int64(v.volumeTotalCapacity ?? 0)
-            )
         }
     }
 }

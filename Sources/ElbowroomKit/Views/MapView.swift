@@ -27,7 +27,7 @@ public struct MapView: View {
     public init() {}
 
     private var currentNode: ScanNode? {
-        model.zoomPath.last ?? model.result?.root
+        model.zoomPath.last.flatMap { model.result?.root.find(path: $0.path) } ?? model.result?.root
     }
 
     public var body: some View {
@@ -293,12 +293,6 @@ struct MapTile: View {
     @ViewBuilder
     private var badges: some View {
         HStack(spacing: 3) {
-            if node?.isStashed == true {
-                Image(systemName: "externaldrive")
-                    .font(.system(size: 8))
-                    .foregroundStyle(BColor.tierManaged)
-                    .help(Copy.inStashBadge)
-            }
             if explainEligible, rect.width >= 60, rect.height >= 30 {
                 Button(action: explain) {
                     Image(systemName: "sparkle")
@@ -315,17 +309,8 @@ struct MapTile: View {
 
     @ViewBuilder
     private var menu: some View {
-        if let item, model.canSelect(item) {
-            Button(Copy.trayReclaim) {
-                model.toggleTray(item)
-                model.openReclaimPlan()
-            }
-        }
-        if let item, item.entry.stashable, !item.isStashed {
-            Button(Copy.trayStash) { model.stashItem(item) }
-        }
-        if let item, let flow = item.entry.teachFlow {
-            Button(Copy.showMe) { model.sheet = .teach(flow, bytes: item.bytes) }
+        if let item, let action = model.action(for: item) {
+            Button(action.title) { model.perform(action, on: item) }
         }
         if explainEligible {
             Button(Copy.askKibi) { explain() }

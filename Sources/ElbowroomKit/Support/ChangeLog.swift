@@ -1,8 +1,9 @@
 import Foundation
+import Observation
 
 /// Changes: a weekly timeline of growth and shrink per owner, 12 weeks
 /// retained, each expandable to its events. Data: one owner-totals snapshot
-/// per scan (at most one a day kept) plus explicit events (reclaims, stashes).
+/// per scan (at most one a day kept) plus explicit events (reclaims).
 public struct OwnerSnapshot: Codable, Sendable {
     public let date: Date
     public let owners: [String: Int64]
@@ -31,44 +32,40 @@ public struct WeekBar: Identifiable {
     public let events: [ChangeEvent]
 }
 
-public final class ChangeLog: @unchecked Sendable {
+@MainActor
+@Observable
+public final class ChangeLog {
     public private(set) var snapshots: [OwnerSnapshot] = []
     public private(set) var events: [ChangeEvent] = []
     private let fileURL: URL
-    private let queue = DispatchQueue(label: "elbowroom.changelog")
+    @ObservationIgnored private let queue = DispatchQueue(label: "elbowroom.changelog")
 
     public init(directory: URL? = nil) {
         let dir = directory ?? ReceiptStore.defaultDirectory()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         fileURL = dir.appendingPathComponent("changes.json")
-        load()
     }
 
     public func recordScan(items: [AtlasItem], disk: DiskSnapshot) {
-        queue.sync {
-            var owners: [String: Int64] = [:]
-            for item in items {
-                owners[item.entry.owner, default: 0] += item.bytes
-            }
-            let snap = OwnerSnapshot(date: Date(), owners: owners, freeBytes: disk.available)
-            // Keep at most one snapshot per day, 13 weeks of history.
-            if let last = snapshots.last, Calendar.current.isDate(last.date, inSameDayAs: snap.date) {
-                snapshots[snapshots.count - 1] = snap
-            } else {
-                snapshots.append(snap)
-            }
-            let cutoff = Date().addingTimeInterval(-13 * 7 * 86_400)
-            snapshots.removeAll { $0.date < cutoff }
-            events.removeAll { $0.date < cutoff }
-            save()
+        var owners: [String: Int64] = [:]
+        for item in items {
+            owners[item.entry.owner, default: 0] += item.bytes
         }
+        let snap = OwnerSnapshot(date: Date(), owners: owners, freeBytes: disk.available)
+        // Keep at most one snapshot per day, 13 weeks of history.
+        if let last = snapshots.last, Calendar.current.isDate(last.date, inSameDayAs: snap.date) {
+            snapshots[snapshots.count - 1] = snap
+        } else {
+            snapshots.append(snap)
+        }
+        let cutoff = Date().addingTimeInterval(-13 * 7 * 86_400)
+        snapshots.removeAll { $0.date < cutoff }
+        events.removeAll { $0.date < cutoff }
+        save()
     }
 
     public func append(_ event: ChangeEvent) {
-        queue.sync {
-            events.append(event)
-            save()
-        }
+        events.append(event)
+        save()
     }
 
     /// Top deltas since a week ago, for the Den's `This week` row.
@@ -117,18 +114,52 @@ public final class ChangeLog: @unchecked Sendable {
         return bars
     }
 
-    private func load() {
-        struct Blob: Codable { var snapshots: [OwnerSnapshot]; var events: [ChangeEvent] }
-        guard let data = try? Data(contentsOf: fileURL),
-              let blob = try? JSONDecoder().decode(Blob.self, from: data) else { return }
-        snapshots = blob.snapshots
-        events = blob.events
+    private struct Blob: Codable, Sendable {
+        var snapshots: [OwnerSnapshot]
+        var events: [ChangeEvent]
+    }
+    @ObservationIgnored private var loaded = false
+    @ObservationIgnored private var loadTask: Task<Blob?, Never>?
+
+    public func loadFromDisk() async {
+        guard !loaded else { return }
+        if loadTask == nil {
+            let file = fileURL, queue = queue
+            loadTask = Task {
+                await withCheckedContinuation { continuation in
+                    queue.async {
+                        continuation.resume(returning: try? JSONDecoder().decode(Blob.self, from: Data(contentsOf: file)))
+                    }
+                }
+            }
+        }
+        let stored = await loadTask!.value
+        guard !loaded else { return }
+        if let stored {
+            let pending = Set(events.map(\.id))
+            events = stored.events.filter { !pending.contains($0.id) } + events
+            let dates = Set(snapshots.map { Calendar.current.startOfDay(for: $0.date) })
+            snapshots = stored.snapshots.filter { !dates.contains(Calendar.current.startOfDay(for: $0.date)) } + snapshots
+        }
+        loaded = true
+        loadTask = nil
+        save()
+    }
+
+    public func flush() async {
+        await loadFromDisk()
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
+        }
     }
 
     private func save() {
-        struct Blob: Codable { var snapshots: [OwnerSnapshot]; var events: [ChangeEvent] }
-        if let data = try? JSONEncoder().encode(Blob(snapshots: snapshots, events: events)) {
-            try? data.write(to: fileURL, options: .atomic)
+        guard loaded else { return }
+        let snapshot = Blob(snapshots: snapshots, events: events), file = fileURL
+        queue.async {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: file, options: .atomic)
         }
     }
 }
