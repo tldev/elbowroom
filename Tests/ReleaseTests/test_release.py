@@ -52,6 +52,41 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(enclosure.attrib[f'{{{release.NS}}}edSignature'], 'signed+archive==')
             self.assertIn('/v1.2.0/Elbowroom-v1.2.0.zip', enclosure.attrib['url'])
 
+    def test_ci_requires_exact_main_commit_and_trusted_event(self):
+        environment = dict(GITHUB_REF='refs/heads/main', GITHUB_EVENT_NAME='push',
+                           GITHUB_REPOSITORY='tldev/elbowroom', GITHUB_SHA='expected')
+        with patch.dict(release.os.environ, environment, clear=True), patch.object(release, 'run', return_value='expected'):
+            release.validate_ci_source()
+            for key, bad in [('GITHUB_REF', 'refs/heads/feature'),
+                             ('GITHUB_EVENT_NAME', 'pull_request'),
+                             ('GITHUB_REPOSITORY', 'someone/fork'),
+                             ('GITHUB_SHA', 'other')]:
+                with self.subTest(key=key), patch.dict(release.os.environ, {key: bad}):
+                    with self.assertRaises(ValueError):
+                        release.validate_ci_source()
+
+    def test_pending_skips_published_versions_but_detects_incomplete_release(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(release, 'ROOT', Path(tmp)), \
+                patch.object(release, 'notes'), patch.object(release, 'run') as run, \
+                patch.dict(release.os.environ, {'GITHUB_OUTPUT': str(Path(tmp) / 'output')}):
+            meta = dict(version='1.1.0', repository='tldev/elbowroom')
+            run.return_value = '[]'
+            self.assertTrue(release.release_pending(meta))
+            self.assertIn('pending=true', (Path(tmp) / 'output').read_text())
+            run.return_value = '[{"tagName":"v1.1.0","isDraft":true}]'
+            with self.assertRaisesRegex(ValueError, 'unfinished draft'):
+                release.release_pending(meta)
+            run.return_value = '[{"tagName":"v1.1.0","isDraft":false}]'
+            feed = Path(tmp) / 'appcast.xml'
+            feed.write_text('<rss><channel/></rss>')
+            with self.assertRaisesRegex(ValueError, 'update feed is missing'):
+                release.release_pending(meta)
+            feed.write_text(f'<rss xmlns:sparkle="{release.NS}"><channel><item>'
+                            '<sparkle:shortVersionString>1.1.0</sparkle:shortVersionString>'
+                            '</item></channel></rss>')
+            self.assertFalse(release.release_pending(meta))
+            self.assertIn('pending=false', (Path(tmp) / 'output').read_text())
+
     def test_publish_rejects_dirty_or_preview_artifacts_before_network_calls(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(release, 'run') as run:
             folder = Path(tmp)

@@ -19,7 +19,8 @@ A Developer ID Application certificate must be in the login Keychain. The
 release uses the existing `notarytool-dorso` notarytool profile on this Mac;
 its Apple credentials are account-wide, not specific to Dorso. Override with
 `NOTARY_PROFILE=your-profile` or change `notary_profile` in `release.json`.
-Credentials stay in Keychain. Do not put passwords or private keys in this repo.
+Local credentials stay in Keychain. GitHub-hosted releases use encrypted repository
+secrets and a disposable runner Keychain. Never commit passwords or private keys.
 
 Elbowroom uses a separate Sparkle signing key with Keychain account `elbowroom`.
 The setup command creates it only if absent and records its **public** key in
@@ -91,27 +92,49 @@ work directory beside the destination for diagnosis.
 
 ## Ship it
 
-When the user explicitly requests a release:
+Merging into `main` runs `.github/workflows/release.yml`. A new version in
+`release.json` triggers tests, a universal build, Developer ID signing, Apple
+notarization, a GitHub release, and an update-feed commit. Ordinary merges with
+an already published version do not publish another release.
 
-1. Fetch and rebase on `origin/main`, preserving any uncommitted work first.
-2. Check `gh release list --repo tldev/elbowroom --limit 5` and existing tags.
-3. Review the semantic version, increased build number, and dated changelog.
-4. Run the tests and review the installer preview.
-5. Commit the reviewed changes and merge to `main` if needed.
-6. Run `./release.sh 1.1.0 --check`, then `./release.sh 1.1.0 --publish`.
+1. Fetch and synchronize with `origin/main`, preserving uncommitted work.
+2. Review existing releases, the new version/build, and dated changelog notes.
+3. Run tests and review the installer preview.
+4. Commit changes in a pull request and merge after its tests pass.
+5. Watch the **Release** workflow through completion and verify the downloads.
 
-Use the desired version in those commands. `--publish` rebuilds from the clean
-commit, atomically pushes main and the new annotated tag, uploads the notarized
-DMG/ZIP and notes to a GitHub release, then commits and pushes the appcast.
-Updates are advertised only after the downloads exist. It refuses existing
-versions/tags and never deletes or replaces a release. A build alone is not
-permission to publish or send messages to contributors.
+The workflow tags the exact triggering commit. It serializes releases and never
+replaces a published tag or assets. GitHub's token publishes the feed without
+triggering another workflow. Updates are advertised only after downloads exist.
 
-If a network failure occurs after the tag or release is published, inspect the
-remote state before continuing. Do not delete the tag or change its target.
-Use the preserved, checksummed artifacts to finish an incomplete upload. If only
-the final appcast push failed, push its existing commit after resolving the
-remote branch; do not rebuild and overwrite the published downloads.
+### GitHub-hosted signing setup
+
+Repository Actions secrets:
+
+- `DEVELOPER_ID_P12`: base64-encoded Developer ID Application certificate and private key.
+- `DEVELOPER_ID_PASSWORD`: password protecting that PKCS#12 export.
+- `SPARKLE_PRIVATE_KEY`: Elbowroom's exported Sparkle signing key.
+- `APPLE_ID`: Apple Developer account email.
+- `APPLE_APP_PASSWORD`: app-specific password for notarization.
+
+Secrets are used only by the release job on `main`, never by pull-request tests.
+`Scripts/ci-signing.py` imports them into a temporary runner keychain and removes
+that keychain after the job. The workflow uses GitHub's temporary token with
+`contents: write` to publish; no long-lived GitHub token is needed.
+
+### Recovery and local fallback
+
+The workflow supports **Run workflow** on `main` to retry before publication.
+If a tag or release already exists after a partial failure, inspect the remote
+state first. Never delete a tag, retarget it, or overwrite published downloads.
+The job retains packaging output as an Actions artifact for 14 days, including
+notarization results. Use those checksummed artifacts to finish an incomplete
+upload. If only the feed commit failed, recover `appcast.xml` from the release
+asset and commit it onto current main after checking its version and history.
+
+For an explicitly requested local fallback, run `./release.sh X.Y.Z --check`,
+then `./release.sh X.Y.Z --publish` from clean, synchronized main. This rebuilds,
+publishes, and updates the feed. Do not race it against a GitHub release job.
 
 ## Automatic updates
 

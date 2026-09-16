@@ -27,8 +27,9 @@ regenerates. Build, test, and layout: see README.
 - Follow `docs/RELEASING.md` for Dorso-style DMG/ZIP releases and semantic versions.
 - `release.json` owns version and build; `CHANGELOG.md` owns user-facing notes.
   Increase both version and build for every release. Never replace a published tag.
-- "Ship it" means synchronize main, review notes, test, commit, then run
-  `./release.sh X.Y.Z --publish`. Building an installer alone does not publish it.
+- "Ship it" means synchronize main, review notes, test, and merge the release PR.
+  Watch the GitHub Release workflow finish; a new version triggers publication.
+  Use `./release.sh X.Y.Z --publish` only as an explicit local fallback.
 - Preserve `dev.elbowroom.app`, the Elbowroom Sparkle key, and existing user data.
   Never copy Dorso's App Store targets, feed, paid features, or reset commands.
 - Use isolated `dist/releases/` or `dist/previews/` output for packaging so the

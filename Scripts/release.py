@@ -103,7 +103,7 @@ def setup_key(meta):
     (ROOT / 'release.json').write_text(json.dumps(meta, indent=2) + '\n')
 
 
-def preflight(meta, publish=False, preview=False):
+def preflight(meta, publish=False, preview=False, ci=False):
     for cmd in ['swift', 'xcrun', 'codesign', 'ditto', 'hdiutil', 'create-dmg', 'git']:
         if not shutil.which(cmd):
             raise ValueError(f'Missing {cmd}. For create-dmg, run: brew install create-dmg')
@@ -115,11 +115,13 @@ def preflight(meta, publish=False, preview=False):
         key = meta['sparkle_public_key']
         if not key or len(base64.b64decode(key, validate=True)) != 32:
             raise ValueError('Run ./release.sh --setup-key before distribution.')
+        if not (SPARKLE / 'generate_keys').exists():
+            run('swift', 'package', 'resolve')
         public = run(SPARKLE / 'generate_keys', '--account', meta['sparkle_key_account'], '-p', capture=True)
         if public != key:
             raise ValueError('The keychain signing key does not match release.json.')
         run('xcrun', 'notarytool', 'history', '--keychain-profile',
-            os.getenv('NOTARY_PROFILE', meta['notary_profile']), '--output-format', 'json', capture=True)
+            os.getenv('NOTARY_PROFILE', meta['notary_profile']), '--output-format', 'json', *notary_keychain_args(), capture=True)
     tag = 'v' + meta['version']
     # Read both GitHub releases and remote tags; never replace a published version.
     if not preview:
@@ -148,16 +150,25 @@ def preflight(meta, publish=False, preview=False):
             raise ValueError('origin must point to tldev/elbowroom.')
         if run('git', 'status', '--porcelain', capture=True):
             raise ValueError('Commit the version, changelog, and app changes before publishing.')
-        if run('git', 'branch', '--show-current', capture=True) != 'main':
-            raise ValueError('Publish from main after merging the reviewed changes.')
         run('git', 'fetch', 'origin', 'main')
-        run('git', 'merge-base', '--is-ancestor', 'origin/main', 'HEAD')
+        if ci:
+            validate_ci_source()
+            run('git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main')
+        else:
+            if run('git', 'branch', '--show-current', capture=True) != 'main':
+                raise ValueError('Publish from main after merging the reviewed changes.')
+            run('git', 'merge-base', '--is-ancestor', 'origin/main', 'HEAD')
     print('Release preflight passed.', flush=True)
+
+
+def notary_keychain_args():
+    keychain = os.getenv('NOTARY_KEYCHAIN')
+    return ['--keychain', keychain] if keychain else []
 
 
 def notarize(path, profile):
     raw = run('xcrun', 'notarytool', 'submit', path, '--keychain-profile', profile,
-              '--wait', '--output-format', 'json', capture=True)
+              '--wait', '--output-format', 'json', *notary_keychain_args(), capture=True)
     result = json.loads(raw)
     path.with_suffix(path.suffix + '.notary.json').write_text(json.dumps(result, indent=2) + '\n')
     if result.get('status') != 'Accepted':
@@ -246,7 +257,7 @@ def package(meta, preview):
     return folder
 
 
-def publish(meta, folder):
+def publish(meta, folder, ci=False):
     manifest = json.loads((folder / 'release-manifest.json').read_text())
     if manifest['dirty'] or not manifest['notarized']:
         raise ValueError('Only a clean, notarized build can be published.')
@@ -257,11 +268,20 @@ def publish(meta, folder):
             raise ValueError(f'Artifact changed after signing: {name}')
     tag = 'v' + meta['version']
     run('git', 'tag', '-a', tag, '-m', f'Elbowroom {tag}')
-    run('git', 'push', '--atomic', 'origin', 'HEAD:refs/heads/main', f'refs/tags/{tag}')
+    if ci:
+        validate_ci_source()
+        run('git', 'push', 'origin', f'refs/tags/{tag}')
+    else:
+        run('git', 'push', '--atomic', 'origin', 'HEAD:refs/heads/main', f'refs/tags/{tag}')
     run('gh', 'release', 'create', tag, folder / f'Elbowroom-{tag}.dmg', folder / f'Elbowroom-{tag}.zip',
-        folder / 'release-notes.html', folder / 'SHA256SUMS', '--repo', meta['repository'], '--verify-tag',
+        folder / 'release-notes.html', folder / 'SHA256SUMS', folder / 'appcast.xml', '--repo', meta['repository'], '--verify-tag',
         '--title', f'Elbowroom {tag}', '--notes-file', folder / 'release-notes.md')
     # Only advertise the update after its downloadable assets are public.
+    if ci:
+        # Build/tag the triggering commit, but add the feed on current main so
+        # an unrelated merge during notarization is never reverted.
+        run('git', 'fetch', 'origin', 'main')
+        run('git', 'checkout', '--detach', 'origin/main')
     shutil.copy2(folder / 'appcast.xml', ROOT / 'appcast.xml')
     run('git', 'add', '--', 'appcast.xml')
     run('git', 'commit', '-m', f'Publish update feed for {tag}', '--', 'appcast.xml')
@@ -269,10 +289,42 @@ def publish(meta, folder):
     print(f"Published https://github.com/{meta['repository']}/releases/tag/{tag}")
 
 
+def validate_ci_source():
+    if os.getenv('GITHUB_REF') != 'refs/heads/main' or os.getenv('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch'):
+        raise ValueError('CI publication is only allowed for main pushes or a main workflow dispatch.')
+    if os.getenv('GITHUB_REPOSITORY') != 'tldev/elbowroom':
+        raise ValueError('CI publication must run in tldev/elbowroom.')
+    if run('git', 'rev-parse', 'HEAD', capture=True) != os.getenv('GITHUB_SHA'):
+        raise ValueError('The checkout does not match the triggering merge commit.')
+
+
+def release_pending(meta):
+    notes(meta)
+    tag = 'v' + meta['version']
+    releases = json.loads(run('gh', 'release', 'list', '--repo', meta['repository'],
+                             '--limit', '100', '--json', 'tagName,isDraft', capture=True))
+    matching = [r for r in releases if r['tagName'] == tag]
+    if matching and matching[0]['isDraft']:
+        raise ValueError(f'{tag} has an unfinished draft release; recover it before retrying.')
+    pending = not matching
+    if not pending:
+        tree = ET.parse(ROOT / 'appcast.xml')
+        versions = [item.findtext(f'{{{NS}}}shortVersionString') for item in tree.findall('channel/item')]
+        if meta['version'] not in versions:
+            raise ValueError(f'{tag} is published but its update feed is missing. Recover the appcast asset.')
+    print(f'{tag}: ' + ('new version, release required' if pending else 'already published; no release needed'))
+    if output := os.getenv('GITHUB_OUTPUT'):
+        with open(output, 'a') as f:
+            f.write(f'pending={str(pending).lower()}\nversion={meta["version"]}\n')
+    return pending
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('version', nargs='?')
+    parser.add_argument('--ci', action='store_true', help='Publish the exact main commit selected by GitHub Actions')
     modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--pending', action='store_true', help='Report whether this version needs a merge-triggered release')
     modes.add_argument('--check', action='store_true', help='Validate a publishable checkout and credentials without building')
     modes.add_argument('--preview', action='store_true', help='Host-architecture installer preview; no notarization or publication')
     modes.add_argument('--publish', action='store_true', help='Build, notarize, tag, push, publish on GitHub, then update the feed')
@@ -280,6 +332,11 @@ def main():
     modes.add_argument('--bump', choices=['patch', 'minor', 'major'], help='Promote Unreleased notes and increment version/build')
     args = parser.parse_args()
     meta = metadata()
+    if args.pending:
+        release_pending(meta)
+        return
+    if args.ci and not (args.publish or args.check):
+        raise ValueError('--ci must be used with --publish or --check.')
     if args.bump:
         bump(args.bump)
         return
@@ -288,12 +345,12 @@ def main():
         return
     if args.version and args.version != meta['version']:
         raise ValueError(f"Requested version differs from release.json ({meta['version']}).")
-    preflight(meta, publish=args.publish or args.check, preview=args.preview)
+    preflight(meta, publish=args.publish or args.check, preview=args.preview, ci=args.ci)
     if args.check:
         return
     folder = package(meta, args.preview)
     if args.publish:
-        publish(meta, folder)
+        publish(meta, folder, ci=args.ci)
 
 
 if __name__ == '__main__':

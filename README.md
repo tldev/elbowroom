@@ -50,7 +50,7 @@ semantic version bumps, changelog entries, notarization, and automatic updates.
 ```sh
 ./test-dmg.sh                    # local installer preview
 ./release.sh 1.1.0               # signed, notarized DMG + ZIP; stays local
-./release.sh 1.1.0 --publish     # explicitly publish and update the feed
+# Merge a version bump + changelog into main to publish through GitHub Actions.
 ```
 
 Version/build metadata lives in `release.json`; release notes come from
@@ -169,6 +169,6 @@ with `swift run ElbowroomSnapshots` before shipping.
 
 ## Remaining external steps (not code)
 
-- **Distribution:** publish the tested release using `release.sh --publish`.
+- **Distribution:** merge a version bump and changelog into `main`; the GitHub Release workflow tests, signs, notarizes, and publishes it.
 - **Japanese review:** the ja table is authored for native review before
   release.
