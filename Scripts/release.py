@@ -145,8 +145,8 @@ def preflight(meta, publish=False, preview=False, ci=False):
         raise ValueError('The build number must exceed every published appcast build.')
     if publish:
         origin = run('git', 'remote', 'get-url', 'origin', capture=True)
-        if origin not in [f"git@github.com:{meta['repository']}.git",
-                          f"https://github.com/{meta['repository']}.git"]:
+        if origin.removesuffix('.git') not in [f"git@github.com:{meta['repository']}",
+                                             f"https://github.com/{meta['repository']}"]:
             raise ValueError('origin must point to tldev/elbowroom.')
         if run('git', 'status', '--porcelain', capture=True):
             raise ValueError('Commit the version, changelog, and app changes before publishing.')
